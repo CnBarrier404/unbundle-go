@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json/jsontext"
 	"encoding/json/v2"
 	"errors"
@@ -8,8 +9,11 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
+	"syscall"
 
 	"unbundle-go/src/internal/config"
+	"unbundle-go/src/internal/gateway"
 	"unbundle-go/src/internal/messages"
 )
 
@@ -21,7 +25,7 @@ func main() {
 }
 
 func run(args []string, in io.Reader, out, diagnostics io.Writer) error {
-	usage := "usage: unbundle config {example|check|show} [--config FILE]\n       unbundle request check --config FILE < request.json\nThese commands never run inference."
+	usage := "usage: unbundle serve --config FILE\n       unbundle config {example|check|show} --config FILE\n       unbundle config example\n       unbundle request check --config FILE < request.json\nOnly authenticated POST /v1/messages on a running server performs inference."
 	if len(args) == 0 || (len(args) == 1 && (args[0] == "--help" || args[0] == "-h")) {
 		_, err := fmt.Fprintln(out, usage)
 		return err
@@ -40,13 +44,18 @@ func run(args []string, in io.Reader, out, diagnostics io.Writer) error {
 		c.Models = []config.Model{{ID: c.DefaultModel, DisplayName: "Claude Sonnet 5.5", CLIModel: c.DefaultModel, OutputTokenLimit: 8192}}
 		return writeJSON(out, c)
 	}
-	if !(args[0] == "config" && (args[1] == "check" || args[1] == "show") || args[0] == "request" && args[1] == "check") {
+	serving := args[0] == "serve"
+	if !(serving || args[0] == "config" && (args[1] == "check" || args[1] == "show") || args[0] == "request" && args[1] == "check") {
 		return errors.New(usage)
 	}
 	flags := flag.NewFlagSet(args[0]+" "+args[1], flag.ContinueOnError)
 	flags.SetOutput(diagnostics)
 	name := flags.String("config", "", "explicit gateway JSON configuration file")
-	if err := flags.Parse(args[2:]); err != nil {
+	flagArgs := args[2:]
+	if serving {
+		flagArgs = args[1:]
+	}
+	if err := flags.Parse(flagArgs); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return nil
 		}
@@ -58,6 +67,11 @@ func run(args []string, in io.Reader, out, diagnostics io.Writer) error {
 	c, err := config.LoadFile(*name)
 	if err != nil {
 		return err
+	}
+	if serving {
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+		return gateway.Serve(ctx, c)
 	}
 	if args[0] == "request" {
 		if _, err := messages.Decode(in, c); err != nil {

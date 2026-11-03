@@ -23,14 +23,21 @@ const (
 )
 
 type Config struct {
-	Version         int     `json:"version"`
-	Profile         string  `json:"profile"`
-	Listen          string  `json:"listen"`
-	TokenFile       string  `json:"token_file"`
-	CLI             *CLI    `json:"cli"`
-	MaxRequestBytes int64   `json:"max_request_bytes"`
-	DefaultModel    string  `json:"default_model"`
-	Models          []Model `json:"models"`
+	Version         int      `json:"version"`
+	Profile         string   `json:"profile"`
+	Listen          string   `json:"listen"`
+	TokenFile       string   `json:"token_file"`
+	CLI             *CLI     `json:"cli"`
+	MaxRequestBytes int64    `json:"max_request_bytes"`
+	DefaultModel    string   `json:"default_model"`
+	Models          []Model  `json:"models"`
+	Runtime         *Runtime `json:"runtime"`
+}
+
+type Runtime struct {
+	RequestTimeoutSeconds int   `json:"request_timeout_seconds"`
+	WriteTimeoutSeconds   int   `json:"write_timeout_seconds"`
+	MaxOutputBytes        int64 `json:"max_output_bytes"`
 }
 
 type CLI struct {
@@ -53,6 +60,7 @@ func Defaults() Config {
 	return Config{
 		Version: SchemaVersion, Profile: "unbundle-go", Listen: "127.0.0.1:38191",
 		CLI: &CLI{Path: "claude", Version: CLIBaseline}, MaxRequestBytes: DefaultMaxRequestBytes,
+		Runtime: &Runtime{RequestTimeoutSeconds: 300, WriteTimeoutSeconds: 15, MaxOutputBytes: 32 << 20},
 	}
 }
 
@@ -115,6 +123,11 @@ func (c Config) Validate() error {
 	}
 	if c.MaxRequestBytes < 1024 || c.MaxRequestBytes > 256<<20 {
 		return fail("max_request_bytes")
+	}
+	if c.Runtime == nil || c.Runtime.RequestTimeoutSeconds < 1 || c.Runtime.RequestTimeoutSeconds > 3600 ||
+		c.Runtime.WriteTimeoutSeconds < 1 || c.Runtime.WriteTimeoutSeconds > 60 ||
+		c.Runtime.MaxOutputBytes < 1024 || c.Runtime.MaxOutputBytes > 256<<20 {
+		return fail("runtime")
 	}
 	if len(c.Models) == 0 || len(c.Models) > 100 {
 		return fail("models")
