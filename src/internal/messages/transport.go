@@ -13,8 +13,8 @@ const (
 )
 
 // ValidateHeaders defines the initial transport dialect. It deliberately does
-// not authenticate a request. No beta is executable until the CLI adapter has
-// verified its semantics; accepting ?beta=true alone grants no capabilities.
+// not authenticate a request. Only markers for the native CLI, thinking blocks
+// and mapped effort are accepted; ?beta=true alone grants no capabilities.
 func ValidateHeaders(headers http.Header) error {
 	values := func(name string) []string {
 		var out []string
@@ -30,8 +30,12 @@ func ValidateHeaders(headers http.Header) error {
 		return invalid("anthropic-version", "requires one supported API version")
 	}
 	for _, beta := range values("anthropic-beta") {
-		if strings.TrimSpace(beta) != "" {
-			return &Error{"UNSUPPORTED_BETA", "anthropic-beta", "beta semantics have not been verified by the CLI adapter"}
+		for _, marker := range strings.Split(beta, ",") {
+			switch strings.TrimSpace(marker) {
+			case "", "claude-code-20250219", "interleaved-thinking-2025-05-14", "effort-2025-11-24":
+			default:
+				return &Error{"UNSUPPORTED_BETA", "anthropic-beta", "beta semantics have not been verified by the CLI adapter"}
+			}
 		}
 	}
 	// Credentials and identity headers are consumed separately; ordinary SDK

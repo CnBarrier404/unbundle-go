@@ -220,6 +220,9 @@ func newInput(delta []messages.Message) bool {
 }
 
 func compatible(a, b messages.Request) bool {
+	if a.CacheTTL != b.CacheTTL {
+		return false
+	}
 	// Streaming and opaque client metadata do not change model semantics.
 	a.Messages = nil
 	b.Messages = nil

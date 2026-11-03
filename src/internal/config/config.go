@@ -35,9 +35,11 @@ type Config struct {
 }
 
 type Runtime struct {
-	RequestTimeoutSeconds int   `json:"request_timeout_seconds"`
-	WriteTimeoutSeconds   int   `json:"write_timeout_seconds"`
-	MaxOutputBytes        int64 `json:"max_output_bytes"`
+	RequestTimeoutSeconds     int   `json:"request_timeout_seconds"`
+	WriteTimeoutSeconds       int   `json:"write_timeout_seconds"`
+	MaxOutputBytes            int64 `json:"max_output_bytes"`
+	ToolWaitTimeoutSeconds    int   `json:"tool_wait_timeout_seconds"`
+	SessionIdleTimeoutSeconds int   `json:"session_idle_timeout_seconds"`
 }
 
 type CLI struct {
@@ -54,13 +56,14 @@ type Model struct {
 	ContextWindow    *int64   `json:"context_window,omitempty"`
 	OutputTokenLimit int64    `json:"output_token_limit"`
 	Efforts          []string `json:"efforts,omitempty"`
+	WebSearch        bool     `json:"web_search,omitempty"`
 }
 
 func Defaults() Config {
 	return Config{
 		Version: SchemaVersion, Profile: "unbundle-go", Listen: "127.0.0.1:38191",
 		CLI: &CLI{Path: "claude", Version: CLIBaseline}, MaxRequestBytes: DefaultMaxRequestBytes,
-		Runtime: &Runtime{RequestTimeoutSeconds: 300, WriteTimeoutSeconds: 15, MaxOutputBytes: 32 << 20},
+		Runtime: &Runtime{RequestTimeoutSeconds: 300, WriteTimeoutSeconds: 15, MaxOutputBytes: 32 << 20, ToolWaitTimeoutSeconds: 1800, SessionIdleTimeoutSeconds: 600},
 	}
 }
 
@@ -128,6 +131,9 @@ func (c Config) Validate() error {
 		c.Runtime.WriteTimeoutSeconds < 1 || c.Runtime.WriteTimeoutSeconds > 60 ||
 		c.Runtime.MaxOutputBytes < 1024 || c.Runtime.MaxOutputBytes > 256<<20 {
 		return fail("runtime")
+	}
+	if c.Runtime.ToolWaitTimeoutSeconds < 1 || c.Runtime.ToolWaitTimeoutSeconds > 86400 || c.Runtime.SessionIdleTimeoutSeconds < 1 || c.Runtime.SessionIdleTimeoutSeconds > 86400 {
+		return fail("runtime session timeouts")
 	}
 	if len(c.Models) == 0 || len(c.Models) > 100 {
 		return fail("models")

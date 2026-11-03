@@ -20,6 +20,14 @@ type Response struct {
 	StopReason   *string          `json:"stop_reason"`
 	StopSequence *string          `json:"stop_sequence"`
 	Usage        Usage            `json:"usage"`
+	// Diagnostic evidence is sent in JSON-response headers, outside Messages.
+	WebSearch *WebSearchEvidence `json:"-"`
+}
+
+type WebSearchEvidence struct {
+	Calls    int
+	Requests *int64
+	Hits     *int64
 }
 
 const (

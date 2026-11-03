@@ -11,11 +11,15 @@ import (
 )
 
 type block struct {
-	Type      string `json:"type"`
-	Text      string `json:"text,omitempty"`
-	Thinking  string `json:"thinking,omitempty"`
-	Signature string `json:"signature,omitempty"`
-	Data      string `json:"data,omitempty"`
+	Type      string         `json:"type"`
+	Text      string         `json:"text,omitempty"`
+	Thinking  string         `json:"thinking,omitempty"`
+	Signature string         `json:"signature,omitempty"`
+	Data      string         `json:"data,omitempty"`
+	ID        string         `json:"id,omitempty"`
+	Name      string         `json:"name,omitempty"`
+	Input     jsontext.Value `json:"input,omitempty"`
+	partial   string
 }
 
 type wireMessage struct {
@@ -32,11 +36,12 @@ type wireEvent struct {
 	Index        int          `json:"index"`
 	ContentBlock *block       `json:"content_block"`
 	Delta        struct {
-		Type       string  `json:"type"`
-		Text       string  `json:"text"`
-		Thinking   string  `json:"thinking"`
-		Signature  string  `json:"signature"`
-		StopReason *string `json:"stop_reason"`
+		Type        string  `json:"type"`
+		Text        string  `json:"text"`
+		Thinking    string  `json:"thinking"`
+		Signature   string  `json:"signature"`
+		PartialJSON string  `json:"partial_json"`
+		StopReason  *string `json:"stop_reason"`
 	} `json:"delta"`
 	Usage messages.Usage `json:"usage"`
 }
@@ -50,6 +55,10 @@ type parser struct {
 	started  bool
 	terminal bool
 	result   bool
+	// Tool events are buffered until the native MCP handoff is verified.
+	tools    map[string]string // native name -> caller name
+	streamed map[string]bool
+	servers  map[string]bool
 }
 
 func protocol() *Error {
@@ -79,7 +88,7 @@ func (p *parser) begin(index int, b block) error {
 	if !p.started || p.terminal || index != len(p.blocks) || index > 0 && !p.closed[index-1] {
 		return protocol()
 	}
-	if b.Type != "text" && b.Type != "thinking" && b.Type != "redacted_thinking" {
+	if b.Type != "text" && b.Type != "thinking" && b.Type != "redacted_thinking" && b.Type != "tool_use" {
 		return protocol()
 	}
 	if b.Type != "text" && b.Text != "" || b.Type != "thinking" && (b.Thinking != "" || b.Signature != "") || b.Type != "redacted_thinking" && b.Data != "" {
@@ -87,6 +96,12 @@ func (p *parser) begin(index int, b block) error {
 	}
 	p.blocks = append(p.blocks, b)
 	p.closed = append(p.closed, false)
+	if b.Type == "tool_use" {
+		if b.ID == "" || p.tools[b.Name] == "" || b.Input.Kind() != '{' {
+			return protocol()
+		}
+		return nil
+	}
 	// Text/thinking fields are required even when their initial values are empty.
 	content := map[string]any{"type": b.Type}
 	switch b.Type {
@@ -108,6 +123,9 @@ func (p *parser) delta(index int, kind, value string) error {
 	b := &p.blocks[index]
 	field := ""
 	switch {
+	case kind == "input_json_delta" && b.Type == "tool_use":
+		b.partial += value
+		return nil
 	case kind == "text_delta" && b.Type == "text":
 		b.Text += value
 		field = "text"
@@ -128,6 +146,16 @@ func (p *parser) closeBlock(index int) error {
 		return protocol()
 	}
 	p.closed[index] = true
+	if b := &p.blocks[index]; b.Type == "tool_use" {
+		if b.partial != "" {
+			b.Input = jsontext.Value(b.partial)
+			b.partial = ""
+		}
+		if b.Input.Kind() != '{' || !b.Input.IsValid() {
+			return protocol()
+		}
+		return nil
+	}
 	return p.send("content_block_stop", map[string]any{"type": "content_block_stop", "index": index})
 }
 
@@ -157,10 +185,11 @@ func (p *parser) finish() error {
 		return protocol()
 	}
 	reason := *p.response.StopReason
-	if reason != messages.StopEndTurn && reason != messages.StopMaxTokens && reason != messages.StopRefusal {
+	if reason != messages.StopEndTurn && reason != messages.StopMaxTokens && reason != messages.StopRefusal && reason != messages.StopToolUse {
 		return protocol()
 	}
 	text := false
+	ids := make(map[string]bool)
 	content := make([]jsontext.Value, 0, len(p.blocks))
 	for i, b := range p.blocks {
 		if !p.closed[i] {
@@ -175,6 +204,12 @@ func (p *parser) finish() error {
 			raw, err = json.Marshal(map[string]string{"type": b.Type, "text": b.Text})
 		} else if b.Type == "thinking" {
 			raw, err = json.Marshal(map[string]string{"type": b.Type, "thinking": b.Thinking, "signature": b.Signature})
+		} else if b.Type == "tool_use" {
+			if ids[b.ID] || reason != messages.StopToolUse || p.tools[b.Name] == "" {
+				return protocol()
+			}
+			ids[b.ID] = true
+			raw, err = json.Marshal(messages.ToolUseBlock{Type: "tool_use", ID: b.ID, Name: p.tools[b.Name], Input: b.Input})
 		} else {
 			raw, err = json.Marshal(b)
 		}
@@ -182,6 +217,9 @@ func (p *parser) finish() error {
 			return protocol()
 		}
 		content = append(content, raw)
+	}
+	if reason == messages.StopToolUse && len(ids) == 0 {
+		return protocol()
 	}
 	if !text && reason == messages.StopEndTurn {
 		return Failure("CLI_EMPTY_OUTPUT", "output", "CLI completed without text output", 502)
@@ -214,8 +252,26 @@ func (p *parser) accept(line []byte) error {
 	}
 	switch frame.Type {
 	case "system":
-		if frame.Subtype == "init" && (len(frame.Tools) != 0 || len(frame.MCPServers) != 0) {
-			return Failure("CLI_TOOLS_ENABLED", "startup", "CLI reported tools despite the text-only policy", 502)
+		if frame.Subtype == "compact_boundary" {
+			return Failure("NATIVE_COMPACTION_UNSUPPORTED", "inference", "native compaction is not supported at this stage", 502)
+		}
+		if frame.Subtype == "init" {
+			if len(frame.Tools) != len(p.tools) {
+				return Failure("CLI_TOOL_SET_MISMATCH", "startup", "CLI did not load exactly the caller tool set", 502)
+			}
+			for _, name := range frame.Tools {
+				if p.tools[name] == "" {
+					return Failure("CLI_TOOLS_ENABLED", "startup", "CLI reported a tool outside the caller tool set", 502)
+				}
+			}
+			for _, raw := range frame.MCPServers {
+				var server struct {
+					Name string `json:"name"`
+				}
+				if json.Unmarshal(raw, &server) != nil || !p.servers[server.Name] {
+					return protocol()
+				}
+			}
 		}
 		return nil
 	case "assistant":
@@ -270,9 +326,21 @@ func (p *parser) accept(line []byte) error {
 			if e.Delta.Type == "signature_delta" {
 				value = e.Delta.Signature
 			}
+			if e.Delta.Type == "input_json_delta" {
+				value = e.Delta.PartialJSON
+			}
 			return p.delta(e.Index, e.Delta.Type, value)
 		case "content_block_stop":
-			return p.closeBlock(e.Index)
+			if err := p.closeBlock(e.Index); err != nil {
+				return err
+			}
+			if b := p.blocks[e.Index]; b.Type == "tool_use" {
+				if p.streamed == nil {
+					p.streamed = make(map[string]bool)
+				}
+				p.streamed[b.ID] = true
+			}
+			return nil
 		case "message_delta":
 			if !p.started || e.Delta.StopReason == nil {
 				return protocol()
@@ -326,6 +394,16 @@ func (p *parser) snapshot(m wireMessage) error {
 			}
 		} else if !jsonutil.Equal(p.blocks[i], expected) {
 			actual := p.blocks[i]
+			if actual.Type == "tool_use" {
+				if p.closed[i] || actual.ID != expected.ID || actual.Name != expected.Name || expected.Input.Kind() != '{' || !expected.Input.IsValid() || actual.partial != "" && !jsonutil.Equal(jsontext.Value(actual.partial), expected.Input) {
+					return protocol()
+				}
+				p.blocks[i] = expected
+				if err := p.closeBlock(i); err != nil {
+					return err
+				}
+				continue
+			}
 			if p.closed[i] || actual.Type != expected.Type || actual.Data != expected.Data ||
 				!strings.HasPrefix(expected.Text, actual.Text) || !strings.HasPrefix(expected.Thinking, actual.Thinking) || !strings.HasPrefix(expected.Signature, actual.Signature) {
 				return protocol()

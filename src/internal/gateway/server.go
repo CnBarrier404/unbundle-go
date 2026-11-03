@@ -1,4 +1,4 @@
-// Package gateway serves the bounded, single-turn Messages inference endpoint.
+// Package gateway serves the bounded native Messages inference endpoint.
 package gateway
 
 import (
@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -26,7 +27,7 @@ import (
 
 type Server struct {
 	config config.Config
-	runner cli.Runner
+	runner *cli.Adapter
 	token  [32]byte
 	active chan struct{}
 }
@@ -61,7 +62,7 @@ func New(ctx context.Context, c config.Config) (*Server, error) {
 	if err := runner.CheckVersion(ctx); err != nil {
 		return nil, err
 	}
-	return &Server{config: c, runner: runner, token: sha256.Sum256([]byte(token)), active: make(chan struct{}, 1)}, nil
+	return &Server{config: c, runner: &cli.Adapter{Config: c, Context: ctx}, token: sha256.Sum256([]byte(token)), active: make(chan struct{}, 1)}, nil
 }
 
 func Serve(ctx context.Context, c config.Config) error {
@@ -69,6 +70,7 @@ func Serve(ctx context.Context, c config.Config) error {
 	if err != nil {
 		return err
 	}
+	defer handler.runner.Close()
 	listener, err := net.Listen("tcp", c.Listen)
 	if err != nil {
 		return errors.New("could not bind configured loopback listener")
@@ -95,20 +97,24 @@ func Serve(ctx context.Context, c config.Config) error {
 
 func (s *Server) authorized(h http.Header) bool {
 	a, k := h.Values("Authorization"), h.Values("X-Api-Key")
-	if len(a) > 1 || len(k) > 1 || len(a)+len(k) != 1 {
+	if len(a) > 1 || len(k) > 1 || len(a)+len(k) == 0 {
 		return false
 	}
-	var value string
+	valid := 1
 	if len(a) == 1 {
 		if !strings.HasPrefix(a[0], "Bearer ") {
 			return false
 		}
-		value = strings.TrimPrefix(a[0], "Bearer ")
-	} else {
-		value = k[0]
+		actual := sha256.Sum256([]byte(strings.TrimPrefix(a[0], "Bearer ")))
+		valid &= subtle.ConstantTimeCompare(actual[:], s.token[:])
 	}
-	actual := sha256.Sum256([]byte(value))
-	return subtle.ConstantTimeCompare(actual[:], s.token[:]) == 1
+	if len(k) == 1 {
+		actual := sha256.Sum256([]byte(k[0]))
+		valid &= subtle.ConstantTimeCompare(actual[:], s.token[:])
+	}
+	// The official CLI can send both headers from apiKeyHelper. Every supplied
+	// credential must match; neither header overrides a conflicting credential.
+	return valid == 1
 }
 
 func (s *Server) writeJSON(w http.ResponseWriter, status int, value any) error {
@@ -125,7 +131,11 @@ func apiError(err error) *cli.Error {
 	}
 	var request *messages.Error
 	if errors.As(err, &request) {
-		return &cli.Error{Code: request.Code, Type: "invalid_request_error", Message: request.Message, Stage: "validation", Outcome: "not_started", Status: 400}
+		message := request.Message
+		if request.Field != "" {
+			message = request.Field + ": " + message
+		}
+		return &cli.Error{Code: request.Code, Type: "invalid_request_error", Message: message, Stage: "validation", Outcome: "not_started", Status: 400}
 	}
 	code, status := "INVALID_JSON", 400
 	var tooLarge *http.MaxBytesError
@@ -158,7 +168,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.Method == http.MethodGet && r.URL.Path == messages.StatusPath {
-		_ = s.writeJSON(w, 200, map[string]any{"status": "ok", "stage": "single_turn_text", "busy": len(s.active) != 0, "cli_version": s.config.CLI.Version, "upstream_auth": "not_checked", "inference": "not_checked"})
+		_ = s.writeJSON(w, 200, map[string]any{"status": "ok", "stage": "native_local_tools", "session_capacity": 1, "busy": len(s.active) != 0, "cli_version": s.config.CLI.Version, "upstream_auth": "not_checked", "inference": "not_checked"})
 		return
 	}
 	if r.Method == http.MethodGet && r.URL.Path == messages.ModelsPath {
@@ -194,7 +204,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, err, id)
 		return
 	}
-	if _, err := session.IdentityFromHeaders(r.Header); err != nil {
+	identity, err := session.IdentityFromHeaders(r.Header)
+	if err != nil {
 		s.fail(w, reject("INVALID_SESSION_IDENTITY", "invalid session identity hints", 400), id)
 		return
 	}
@@ -202,7 +213,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case s.active <- struct{}{}:
 		defer func() { <-s.active }()
 	default:
-		e := reject("GATEWAY_BUSY", "single-turn inference capacity is occupied", 503)
+		e := reject("GATEWAY_BUSY", "native inference capacity is occupied", 503)
 		e.Type, e.Retryable = "overloaded_error", true
 		s.fail(w, e, id)
 		return
@@ -220,17 +231,26 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, err, id)
 		return
 	}
-	s.infer(w, r, request, id)
+	s.infer(w, r, request, identity, id)
 }
 
-func (s *Server) infer(w http.ResponseWriter, r *http.Request, request messages.Request, id string) {
+func (s *Server) infer(w http.ResponseWriter, r *http.Request, request messages.Request, identity session.Identity, id string) {
 	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(s.config.Runtime.RequestTimeoutSeconds)*time.Second)
 	defer cancel()
 	if !request.Stream {
-		response, err := s.runner.Run(ctx, request, nil)
+		response, err := s.runner.Run(ctx, request, identity, nil)
 		if err != nil {
 			s.fail(w, err, id)
 			return
+		}
+		if evidence := response.WebSearch; evidence != nil {
+			w.Header().Set("X-Unbundle-Web-Search-Calls", strconv.Itoa(evidence.Calls))
+			if evidence.Requests != nil {
+				w.Header().Set("X-Unbundle-Web-Search-Requests", strconv.FormatInt(*evidence.Requests, 10))
+			}
+			if evidence.Hits != nil {
+				w.Header().Set("X-Unbundle-Web-Search-Hits", strconv.FormatInt(*evidence.Hits, 10))
+			}
 		}
 		_ = s.writeJSON(w, 200, response)
 		return
@@ -242,7 +262,7 @@ func (s *Server) infer(w http.ResponseWriter, r *http.Request, request messages.
 	}
 	done := make(chan result, 1)
 	go func() {
-		response, err := s.runner.Run(ctx, request, func(event cli.Event) error {
+		response, err := s.runner.Run(ctx, request, identity, func(event cli.Event) error {
 			select {
 			case events <- event:
 				return nil

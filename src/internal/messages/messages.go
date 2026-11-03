@@ -26,6 +26,9 @@ type Request struct {
 	OutputConfig  *OutputConfig  `json:"output_config,omitempty"`
 	Metadata      *Metadata      `json:"metadata,omitempty"`
 	StopSequences []string       `json:"stop_sequences,omitempty"`
+	// CacheTTL is derived from transport hints. The official CLI owns cache
+	// breakpoints; annotations are removed before native history comparison.
+	CacheTTL string `json:"-"`
 }
 
 type Message struct {
@@ -129,7 +132,7 @@ func Decode(r io.Reader, c config.Config) (Request, error) {
 			return Request{}, unsupported("output_config.effort")
 		}
 	}
-	return request, nil
+	return request.NormalizeCache()
 }
 
 func (r Request) Validate() error {
@@ -252,7 +255,7 @@ func (r Request) Validate() error {
 					return invalid(field, "tool_result does not match an outstanding call")
 				}
 				if len(block.Content) > 0 {
-					if err := textContent(block.Content, true); err != nil {
+					if err := resultContent(block.Content); err != nil {
 						return err
 					}
 				}
@@ -260,6 +263,34 @@ func (r Request) Validate() error {
 					return err
 				}
 				delete(pending, block.ToolUseID)
+			case "thinking", "redacted_thinking":
+				if message.Role != "assistant" {
+					return invalid(field, "thinking requires assistant role")
+				}
+				if kind == "thinking" {
+					var block struct {
+						Type      string  `json:"type"`
+						Thinking  *string `json:"thinking"`
+						Signature *string `json:"signature"`
+					}
+					if err := jsonutil.Object(raw, &block); err != nil {
+						return err
+					}
+					if block.Thinking == nil || block.Signature == nil {
+						return invalid(field, "thinking requires content and signature")
+					}
+				} else {
+					var block struct {
+						Type string  `json:"type"`
+						Data *string `json:"data"`
+					}
+					if err := jsonutil.Object(raw, &block); err != nil {
+						return err
+					}
+					if block.Data == nil {
+						return invalid(field, "redacted thinking requires data")
+					}
+				}
 			default:
 				return unsupported(field + ".content.type")
 			}
