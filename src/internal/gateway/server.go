@@ -9,6 +9,7 @@ import (
 	"encoding/json/v2"
 	"errors"
 	"io"
+	"log/slog"
 	"mime"
 	"net"
 	"net/http"
@@ -21,6 +22,7 @@ import (
 	"unbundle-go/src/internal/cli"
 	"unbundle-go/src/internal/config"
 	"unbundle-go/src/internal/jsonutil"
+	"unbundle-go/src/internal/logging"
 	"unbundle-go/src/internal/messages"
 	"unbundle-go/src/internal/session"
 )
@@ -30,6 +32,7 @@ type Server struct {
 	runner *cli.Adapter
 	token  [32]byte
 	active chan struct{}
+	logger *slog.Logger
 }
 
 func New(ctx context.Context, c config.Config) (*Server, error) {
@@ -37,16 +40,21 @@ func New(ctx context.Context, c config.Config) (*Server, error) {
 		return nil, err
 	}
 	info, err := os.Lstat(c.TokenFile)
+	if err != nil {
+		logging.From(ctx).Error("token_file_check_failed", logging.Cause(err))
+	}
 	if err != nil || !info.Mode().IsRegular() || info.Size() > 4096 || runtime.GOOS != "windows" && info.Mode().Perm()&0077 != 0 {
 		return nil, errors.New("gateway token must be a private regular file (Unix mode 0600 or stricter)")
 	}
 	f, err := os.Open(c.TokenFile)
 	if err != nil {
+		logging.From(ctx).Error("token_file_read_failed", logging.Cause(err))
 		return nil, errors.New("could not read gateway token")
 	}
 	data, err := io.ReadAll(io.LimitReader(f, 4097))
 	_ = f.Close()
 	if err != nil || len(data) > 4096 {
+		logging.From(ctx).Error("token_file_read_failed", logging.Cause(err))
 		return nil, errors.New("could not read bounded gateway token")
 	}
 	token := strings.TrimSuffix(strings.TrimSuffix(string(data), "\n"), "\r")
@@ -66,10 +74,13 @@ func New(ctx context.Context, c config.Config) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Server{config: c, runner: adapter, token: sha256.Sum256([]byte(token)), active: make(chan struct{}, c.Runtime.MaxActiveRequests)}, nil
+	return &Server{config: c, runner: adapter, token: sha256.Sum256([]byte(token)), active: make(chan struct{}, c.Runtime.MaxActiveRequests), logger: logging.From(ctx)}, nil
 }
 
 func Serve(ctx context.Context, c config.Config) error {
+	logger := logging.From(ctx).With("component", "gateway")
+	ctx = logging.With(ctx, logger)
+	logger.Info("gateway_starting", "listen", c.Listen)
 	handler, err := New(ctx, c)
 	if err != nil {
 		return err
@@ -77,24 +88,30 @@ func Serve(ctx context.Context, c config.Config) error {
 	defer handler.runner.Close()
 	listener, err := net.Listen("tcp", c.Listen)
 	if err != nil {
+		logger.Error("listener_bind_failed", logging.Cause(err))
 		return errors.New("could not bind configured loopback listener")
 	}
 	server := &http.Server{Handler: handler, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 32 << 10, BaseContext: func(net.Listener) context.Context { return ctx }}
 	done := make(chan error, 1)
+	logger.Info("gateway_started", "listen", listener.Addr().String(), "cli_version", c.CLI.Version)
 	go func() { done <- server.Serve(listener) }()
 	select {
 	case err := <-done:
 		if errors.Is(err, http.ErrServerClosed) {
 			return nil
 		}
+		logger.Error("http_server_failed", logging.Cause(err))
 		return errors.New("gateway HTTP server failed")
 	case <-ctx.Done():
+		logger.Info("gateway_stopping")
 		shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		if err := server.Shutdown(shutdown); err != nil {
+			logger.Warn("http_shutdown_forced", logging.Cause(err))
 			_ = server.Close()
 		}
 		<-done
+		logger.Info("gateway_http_stopped")
 		return nil
 	}
 }
@@ -125,7 +142,11 @@ func (s *Server) writeJSON(w http.ResponseWriter, status int, value any) error {
 	_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(time.Duration(s.config.Runtime.WriteTimeoutSeconds) * time.Second))
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	return json.MarshalWrite(w, value)
+	err := json.MarshalWrite(w, value)
+	if err != nil {
+		w.(*loggedResponse).writeErr = err
+	}
+	return err
 }
 
 func apiError(err error) *cli.Error {
@@ -151,6 +172,7 @@ func apiError(err error) *cli.Error {
 
 func (s *Server) fail(w http.ResponseWriter, err error, requestID string) {
 	e := apiError(err)
+	w.(*loggedResponse).failure = e
 	_ = s.writeJSON(w, e.Status, map[string]any{"type": "error", "error": e, "request_id": requestID})
 }
 
@@ -162,6 +184,13 @@ func reject(code, message string, status int) *cli.Error {
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	id := "req_" + rand.Text()
+	method, route := requestRoute(r)
+	logger := s.logger.With("request_id", id, "method", method, "route", route)
+	r = r.WithContext(logging.With(r.Context(), logger))
+	response := &loggedResponse{ResponseWriter: w, status: http.StatusOK, result: "completed"}
+	w = response
+	defer response.finish(logger, r, time.Now())
+	logger.Debug("request_started")
 	w.Header().Set("request-id", id)
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
@@ -239,6 +268,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) infer(w http.ResponseWriter, r *http.Request, request messages.Request, identity session.Identity, id string) {
+	observed := w.(*loggedResponse)
+	observed.model, observed.stream = request.Model, request.Stream
 	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(s.config.Runtime.RequestTimeoutSeconds)*time.Second)
 	defer cancel()
 	if !request.Stream {
@@ -318,15 +349,18 @@ func (s *Server) infer(w http.ResponseWriter, r *http.Request, request messages.
 			return
 		case <-heartbeat.C:
 			if err := send("ping", map[string]string{"type": "ping"}); err != nil {
+				observed.writeErr = err
 				return
 			}
 		case event := <-events:
 			if err := send(event.Type, event.Data); err != nil {
+				observed.writeErr = err
 				return
 			}
 		case result := <-done:
 			finished = true
 			if result.err != nil {
+				observed.failure = apiError(result.err)
 				if !started {
 					s.fail(w, result.err, id)
 				} else {
@@ -339,9 +373,12 @@ func (s *Server) infer(w http.ResponseWriter, r *http.Request, request messages.
 				w.Header().Set("X-Unbundle-Response-Reused", "true")
 			}
 			if err := send("message_delta", map[string]any{"type": "message_delta", "delta": map[string]any{"stop_reason": result.response.StopReason, "stop_sequence": nil}, "usage": result.response.Usage}); err != nil {
+				observed.writeErr = err
 				return
 			}
-			_ = send("message_stop", map[string]string{"type": "message_stop"})
+			if err := send("message_stop", map[string]string{"type": "message_stop"}); err != nil {
+				observed.writeErr = err
+			}
 			return
 		}
 	}

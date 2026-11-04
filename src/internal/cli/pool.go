@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"unbundle-go/src/internal/config"
+	"unbundle-go/src/internal/logging"
 	"unbundle-go/src/internal/messages"
 	"unbundle-go/src/internal/session"
 )
@@ -56,10 +57,12 @@ type PoolStatus struct {
 func NewAdapter(ctx context.Context, c config.Config) (*Adapter, error) {
 	store, err := session.OpenStore(c.StateDir)
 	if err != nil {
+		logging.From(ctx).Error("checkpoint_store_open_failed", logging.Cause(err))
 		return nil, Failure("CHECKPOINT_STORE_FAILED", "startup", "could not open the private checkpoint store", 503)
 	}
 	rows, err := store.Load()
 	if err != nil {
+		logging.From(ctx).Error("checkpoint_store_load_failed", logging.Cause(err))
 		_ = store.Close()
 		return nil, Failure("CHECKPOINT_STORE_INVALID", "startup", "could not load checkpoint records", 503)
 	}
@@ -72,6 +75,7 @@ func NewAdapter(ctx context.Context, c config.Config) (*Adapter, error) {
 		}
 		a.entries[row.ID] = &conversation{boundary: session.Candidate{ID: row.ID, Identity: row.Identity, State: state}, checkpoint: &row}
 	}
+	logging.From(ctx).Info("session_pool_loaded", "records", len(rows), "capacity", c.Runtime.MaxSessions)
 	return a, nil
 }
 
@@ -239,6 +243,7 @@ func (a *Adapter) acquire(ctx context.Context, request messages.Request, identit
 }
 
 func (a *Adapter) retireLocked(entry *conversation) {
+	logging.From(a.ctx).Debug("session_retiring", "session_id", entry.boundary.ID)
 	entry.retiring = true
 	entry.boundary.State = session.Closed
 	n := entry.native
@@ -283,7 +288,10 @@ func (a *Adapter) Close() {
 		go func() { defer cleanup.Done(); n.close() }()
 	}
 	cleanup.Wait()
-	_ = a.store.Close()
+	if err := a.store.Close(); err != nil {
+		logging.From(a.ctx).Error("checkpoint_store_close_failed", logging.Cause(err))
+	}
+	logging.From(a.ctx).Info("session_pool_closed")
 	a.mu.Lock()
 	a.reapLocked()
 	close(a.closeDone)

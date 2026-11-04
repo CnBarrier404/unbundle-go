@@ -14,6 +14,7 @@ import (
 
 	"unbundle-go/src/internal/config"
 	"unbundle-go/src/internal/gateway"
+	"unbundle-go/src/internal/logging"
 	"unbundle-go/src/internal/messages"
 )
 
@@ -71,7 +72,13 @@ func run(args []string, in io.Reader, out, diagnostics io.Writer) error {
 	if serving {
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer stop()
-		return gateway.Serve(ctx, c)
+		logger := logging.New(diagnostics, c.Logging.Level, c.Logging.Format).With("profile", c.Profile)
+		ctx = logging.With(ctx, logger)
+		if err := gateway.Serve(ctx, c); err != nil {
+			logger.Error("gateway_failed", logging.Cause(err))
+			return err
+		}
+		return nil
 	}
 	if args[0] == "request" {
 		if _, err := messages.Decode(in, c); err != nil {

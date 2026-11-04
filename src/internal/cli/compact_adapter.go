@@ -11,6 +11,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"unbundle-go/src/internal/logging"
 	"unbundle-go/src/internal/messages"
 	"unbundle-go/src/internal/session"
 )
@@ -22,6 +23,8 @@ func compactResponse(model, id, body string, usage messages.Usage) messages.Resp
 }
 
 func (a *Adapter) runCompact(ctx context.Context, entry *conversation, match session.Match, previous session.State, request messages.Request, emit func(Event) error) (response messages.Response, err error) {
+	logger := logging.From(ctx)
+	logger.Debug("compaction_started", "reuse", match.Kind == session.CompactRetry)
 	n := entry.native
 	accepted := false
 	keep := true
@@ -62,14 +65,17 @@ func (a *Adapter) runCompact(ctx context.Context, entry *conversation, match ses
 	row := *entry.checkpoint
 	if match.Kind == session.CompactRetry {
 		if err := a.store.Verify(row); err != nil {
+			logger.Warn("compaction_checkpoint_verify_failed", logging.Cause(err))
 			return response, validation("NATIVE_CHECKPOINT_CHANGED", "committed compaction transcript changed; the summary will not be regenerated")
 		}
 		body, _, err := a.store.CompactSnapshot(ctx, row.NativeID, row.Compaction.Boundary, a.Config.Runtime.MaxOutputBytes)
 		if err != nil {
+			logger.Error("compaction_summary_load_failed", logging.Cause(err))
 			return response, validation("COMPACTION_SUMMARY_UNAVAILABLE", "committed native summary is unavailable; the summary will not be regenerated")
 		}
 		response = compactResponse(request.Model, row.Compaction.ResponseID, body, row.Compaction.Usage)
 		response.Reused = true
+		logger.Info("compaction_response_reused")
 		if emit != nil {
 			err = emitResponse(response, emit)
 		}
@@ -80,6 +86,7 @@ func (a *Adapter) runCompact(ctx context.Context, entry *conversation, match ses
 	}
 	if n == nil {
 		if err := a.store.Verify(row); err != nil {
+			logger.Warn("compaction_checkpoint_verify_failed", logging.Cause(err))
 			return response, validation("NATIVE_CHECKPOINT_CHANGED", "native completion checkpoint is unavailable or changed")
 		}
 		base := entry.boundary.Request
@@ -88,7 +95,8 @@ func (a *Adapter) runCompact(ctx context.Context, entry *conversation, match ses
 		if err != nil {
 			return response, err
 		}
-		n, err = (Runner{Config: a.Config}).start(a.ctx, ctx, base, b, &row)
+		lifetime := logging.With(a.ctx, logging.From(a.ctx).With("session_id", entry.boundary.ID))
+		n, err = (Runner{Config: a.Config}).start(lifetime, ctx, base, b, &row)
 		if err != nil {
 			return response, err
 		}
@@ -121,6 +129,7 @@ func (a *Adapter) runCompact(ctx context.Context, entry *conversation, match ses
 	// context, or committing /compact. A crash can never reuse the old boundary.
 	row.Ready = false
 	if err := a.store.Put(row); err != nil {
+		logger.Error("compaction_checkpoint_consume_failed", logging.Cause(err))
 		return response, validation("CHECKPOINT_CONSUME_FAILED", "could not revoke the previous checkpoint; compaction was not submitted")
 	}
 	a.mu.Lock()
@@ -134,6 +143,7 @@ func (a *Adapter) runCompact(ctx context.Context, entry *conversation, match ses
 	}
 	body, snapshot, err := a.store.CompactSnapshot(ctx, n.id, boundary, a.Config.Runtime.MaxOutputBytes)
 	if err != nil {
+		logger.Error("compaction_snapshot_failed", logging.Cause(err))
 		return response, Failure("NATIVE_COMPACT_NOT_PERSISTED", "compaction", "native compaction did not produce a verifiable persisted summary; do not repeat the operation", 502)
 	}
 	id := "msg_" + uuid.NewString()
@@ -146,12 +156,14 @@ func (a *Adapter) runCompact(ctx context.Context, entry *conversation, match ses
 	row.SystemPrompt, row.Instructions = n.prompt, slices.Clone(n.instructions)
 	completed, err := a.store.RecordCompaction(row, request, boundary, payload, id, usage, snapshot, source)
 	if err != nil {
+		logger.Error("compaction_checkpoint_save_failed", logging.Cause(err))
 		return response, Failure("COMPACTION_CHECKPOINT_SAVE_FAILED", "compaction", "native compaction committed but its recovery receipt could not be saved; do not repeat the operation", 503)
 	}
 	a.mu.Lock()
 	entry.checkpoint = &completed
 	a.mu.Unlock()
 	response = compactResponse(request.Model, id, body, usage)
+	logger.Info("compaction_committed")
 	// Commit precedes response delivery. A disconnect reuses this exact receipt;
 	// it must never consume another model request or replay a tool operation.
 	accepted = false

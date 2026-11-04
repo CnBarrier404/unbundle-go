@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"unbundle-go/src/internal/jsonutil"
+	"unbundle-go/src/internal/logging"
 	"unbundle-go/src/internal/messages"
 	"unbundle-go/src/internal/session"
 )
@@ -27,6 +28,17 @@ func (a *Adapter) Run(ctx context.Context, request messages.Request, identity se
 	if err != nil {
 		return response, err
 	}
+	logger := logging.From(ctx).With("session_id", entry.boundary.ID)
+	ctx = logging.With(ctx, logger)
+	logger.Debug("session_acquired", "match", string(match.Kind), "previous_state", string(previous))
+	start := time.Now()
+	defer func() {
+		if err != nil {
+			logFailure(logger, "session_turn_failed", err)
+			return
+		}
+		logger.Info("session_turn_finished", "duration_ms", time.Since(start).Milliseconds(), "stop_reason", response.StopReason, "response_reused", response.Reused)
+	}()
 	if match.Kind == session.Compact || match.Kind == session.CompactRetry {
 		return a.runCompact(ctx, entry, match, previous, request, emit)
 	}
@@ -95,6 +107,7 @@ func (a *Adapter) Run(ctx context.Context, request messages.Request, identity se
 		if match.Kind != session.New {
 			resume = entry.checkpoint
 			if err := a.store.Verify(*resume); err != nil {
+				logger.Warn("checkpoint_verify_failed", logging.Cause(err))
 				return response, validation("NATIVE_CHECKPOINT_CHANGED", "native completion checkpoint is unavailable or changed")
 			}
 		}
@@ -103,7 +116,8 @@ func (a *Adapter) Run(ctx context.Context, request messages.Request, identity se
 		if err != nil {
 			return response, err
 		}
-		n, err = (Runner{Config: a.Config}).start(a.ctx, ctx, request, b, resume)
+		lifetime := logging.With(a.ctx, logging.From(a.ctx).With("session_id", entry.boundary.ID))
+		n, err = (Runner{Config: a.Config}).start(lifetime, ctx, request, b, resume)
 		if err != nil {
 			return response, err
 		}
@@ -133,6 +147,7 @@ func (a *Adapter) Run(ctx context.Context, request messages.Request, identity se
 	}
 	activeRecord, err := a.store.Active(entry.boundary.ID, binding, n.id, n.initialMessages, request, a.Config)
 	if err != nil {
+		logger.Error("checkpoint_consume_failed", logging.Cause(err))
 		failure := Failure("CHECKPOINT_CONSUME_FAILED", "checkpoint", "could not commit the new boundary; no input or tool result was submitted", 503)
 		failure.Outcome = "not_started"
 		return response, failure
@@ -170,9 +185,11 @@ func (a *Adapter) Run(ctx context.Context, request messages.Request, identity se
 			}
 		}
 		if saveErr != nil {
+			logger.Error("checkpoint_save_failed", logging.Cause(saveErr))
 			response.Recovery.Code = "CHECKPOINT_SAVE_FAILED"
 		}
 	}
+	logger.Debug("checkpoint_state", "recovery", response.Recovery.State)
 	if *response.StopReason == messages.StopMaxTokens || *response.StopReason == messages.StopRefusal {
 		n.close()
 	} else {

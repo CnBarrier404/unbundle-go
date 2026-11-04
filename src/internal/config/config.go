@@ -33,6 +33,12 @@ type Config struct {
 	DefaultModel    string   `json:"default_model"`
 	Models          []Model  `json:"models"`
 	Runtime         *Runtime `json:"runtime"`
+	Logging         *Logging `json:"logging"`
+}
+
+type Logging struct {
+	Level  string `json:"level"`
+	Format string `json:"format"`
 }
 
 type Runtime struct {
@@ -67,6 +73,7 @@ func Defaults() Config {
 	return Config{
 		Version: SchemaVersion, Profile: "unbundle-go", Listen: "127.0.0.1:38191", StateDir: "data/unbundle-go",
 		CLI: &CLI{Path: "claude", Version: CLIBaseline}, MaxRequestBytes: DefaultMaxRequestBytes,
+		Logging: &Logging{Level: "info", Format: "json"},
 		Runtime: &Runtime{MaxActiveRequests: 5, MaxSessions: 5, MaxSessionRecords: 128, RequestTimeoutSeconds: 300, WriteTimeoutSeconds: 15, MaxOutputBytes: 32 << 20, ToolWaitTimeoutSeconds: 1800, SessionIdleTimeoutSeconds: 600},
 	}
 }
@@ -130,6 +137,9 @@ func (c Config) Validate() error {
 	}
 	if !plain(c.StateDir) {
 		return fail("state_dir")
+	}
+	if c.Logging == nil || !slices.Contains([]string{"debug", "info", "warn", "error"}, c.Logging.Level) || !slices.Contains([]string{"json", "text"}, c.Logging.Format) {
+		return fail("logging (requires level debug/info/warn/error and format json/text)")
 	}
 	if c.CLI == nil || !plain(c.CLI.Path) || c.CLI.Version != CLIBaseline {
 		return fail("cli (requires the baseline version 2.1.316)")

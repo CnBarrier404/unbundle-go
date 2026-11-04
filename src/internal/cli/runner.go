@@ -5,13 +5,13 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"io"
 	"os"
 	"os/exec"
 	"strings"
 	"time"
 
 	"unbundle-go/src/internal/config"
+	"unbundle-go/src/internal/logging"
 	"unbundle-go/src/internal/messages"
 )
 
@@ -69,7 +69,6 @@ func environment() []string {
 func command(ctx context.Context, path string, args ...string) *exec.Cmd {
 	cmd := exec.CommandContext(ctx, path, args...)
 	cmd.Env = environment()
-	cmd.Stderr = io.Discard
 	cmd.WaitDelay = 2 * time.Second
 	configureProcess(cmd)
 	return cmd
@@ -87,16 +86,23 @@ func (b *boundedBuffer) Write(p []byte) (int, error) {
 // CheckVersion is model-free. A matching version is not protocol acceptance or
 // proof of account access; live acceptance is a separate explicit operation.
 func (r Runner) CheckVersion(ctx context.Context) error {
+	logger := logging.From(ctx)
+	logger.Debug("cli_version_check_started", "expected_version", r.Config.CLI.Version)
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	cmd := command(ctx, r.Config.CLI.Path, "--version")
 	var output boundedBuffer
+	var diagnostics diagnosticCount
 	cmd.Stdout = &output
+	cmd.Stderr = &diagnostics
 	if err := cmd.Run(); err != nil {
+		logger.Error("cli_version_check_failed", logging.Cause(err), "stderr_bytes", diagnostics.bytes.Load())
 		return Failure("CLI_VERSION_FAILED", "startup", "could not check the official CLI version", 503)
 	}
 	if strings.TrimSpace(output.String()) != r.Config.CLI.Version+" (Claude Code)" {
+		logger.Error("cli_version_mismatch", "expected_version", r.Config.CLI.Version)
 		return Failure("CLI_VERSION_MISMATCH", "startup", "official CLI version does not match configuration", 503)
 	}
+	logger.Debug("cli_version_check_finished", "version", r.Config.CLI.Version)
 	return nil
 }

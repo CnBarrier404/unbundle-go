@@ -11,7 +11,6 @@ import (
 	"encoding/json/jsontext"
 	"encoding/json/v2"
 	"errors"
-	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -25,6 +24,7 @@ import (
 	"github.com/santhosh-tekuri/jsonschema/v6"
 
 	"unbundle-go/src/internal/jsonutil"
+	"unbundle-go/src/internal/logging"
 	"unbundle-go/src/internal/messages"
 )
 
@@ -65,6 +65,7 @@ type bridge struct {
 	instructionRevision int
 	instructionName     string
 	interruptedIDs      sync.Map
+	logger              *slog.Logger
 }
 
 func prepareBridge(request messages.Request, webSearch bool) (*bridge, error) {
@@ -151,6 +152,7 @@ func fmtAlias(sum [32]byte) string {
 func (b *bridge) fail(err error) {
 	select {
 	case b.errors <- err:
+		logFailure(b.logger, "mcp_bridge_failed", err)
 	default:
 	}
 	if b.onFailure != nil {
@@ -160,7 +162,8 @@ func (b *bridge) fail(err error) {
 
 func (b *bridge) start(ctx context.Context, request messages.Request, maxBytes int64, wait time.Duration) error {
 	b.ctx, b.cancel = context.WithCancel(ctx)
-	s := mcp.NewServer(&mcp.Implementation{Name: "unbundle-local-tools", Version: "1"}, &mcp.ServerOptions{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	logger := logging.SDK(b.logger)
+	s := mcp.NewServer(&mcp.Implementation{Name: "unbundle-local-tools", Version: "1"}, &mcp.ServerOptions{Logger: logger})
 	for _, tool := range request.Tools {
 		sum := sha256.Sum256([]byte(tool.Name))
 		alias := fmtAlias(sum)
@@ -201,9 +204,10 @@ func (b *bridge) start(ctx context.Context, request messages.Request, maxBytes i
 			}
 		})
 	}
-	b.handler = mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return s }, &mcp.StreamableHTTPOptions{Stateless: true, JSONResponse: true, Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	b.handler = mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return s }, &mcp.StreamableHTTPOptions{Stateless: true, JSONResponse: true, Logger: logger})
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
+		b.logger.Error("mcp_listener_bind_failed", logging.Cause(err))
 		b.close()
 		return Failure("MCP_START_FAILED", "startup", "could not bind private MCP listener", 503)
 	}
@@ -255,9 +259,11 @@ func (b *bridge) start(ctx context.Context, request messages.Request, maxBytes i
 	}
 	go func() {
 		if err := b.server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			b.logger.Error("mcp_listener_failed", logging.Cause(err))
 			b.fail(Failure("MCP_SERVER_FAILED", "tools", "private MCP listener failed", 502))
 		}
 	}()
+	b.logger.Debug("mcp_bridge_started", "tool_count", len(b.definitions))
 	return nil
 }
 

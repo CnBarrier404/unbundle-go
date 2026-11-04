@@ -5,14 +5,13 @@ import (
 	"crypto/rand"
 	"encoding/json/jsontext"
 	"encoding/json/v2"
-	"io"
-	"log/slog"
 	"net/http"
 	"slices"
 	"strconv"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"unbundle-go/src/internal/logging"
 	"unbundle-go/src/internal/session"
 )
 
@@ -27,7 +26,7 @@ func (b *bridge) stageInstructions(updates []instructionUpdate) (string, any, er
 	}
 	b.instructionRevision++
 	name := "caller_instructions_" + strconv.Itoa(b.instructionRevision)
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	logger := logging.SDK(b.logger)
 	server := mcp.NewServer(&mcp.Implementation{Name: name, Version: "1"}, &mcp.ServerOptions{Instructions: string(payload), Logger: logger})
 	handler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return server }, &mcp.StreamableHTTPOptions{Stateless: true, JSONResponse: true, Logger: logger})
 	b.instructionMu.Lock()
@@ -68,6 +67,7 @@ func (n *native) updateInstructions(ctx context.Context, updates []instructionUp
 	n.bridge.instructionMu.Unlock()
 	n.bridge.instructionName = name
 	n.instructions = all
+	logging.From(ctx).Debug("caller_instructions_updated", "update_count", len(updates))
 	return nil
 }
 
