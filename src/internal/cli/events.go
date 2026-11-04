@@ -255,7 +255,7 @@ func (p *parser) accept(line []byte) error {
 	switch frame.Type {
 	case "system":
 		if frame.Subtype == "compact_boundary" {
-			return Failure("NATIVE_COMPACTION_UNSUPPORTED", "inference", "native compaction is not supported at this stage", 502)
+			return Failure("UNEXPECTED_NATIVE_COMPACTION", "inference", "unrequested native compaction cannot be reconciled with client history", 502)
 		}
 		if frame.Subtype == "init" {
 			if frame.SessionID != p.nativeID {

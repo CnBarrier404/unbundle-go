@@ -7,6 +7,7 @@ import (
 	"errors"
 	"time"
 
+	"unbundle-go/src/internal/jsonutil"
 	"unbundle-go/src/internal/messages"
 	"unbundle-go/src/internal/session"
 )
@@ -25,6 +26,9 @@ func (a *Adapter) Run(ctx context.Context, request messages.Request, identity se
 	entry, match, previous, err := a.acquire(ctx, request, identity)
 	if err != nil {
 		return response, err
+	}
+	if match.Kind == session.Compact || match.Kind == session.CompactRetry {
+		return a.runCompact(ctx, entry, match, previous, request, emit)
 	}
 	// The reservation gives this request exclusive ownership of native protocol
 	// state. Pool locks protect only boundaries and resource accounting.
@@ -66,6 +70,12 @@ func (a *Adapter) Run(ctx context.Context, request messages.Request, identity se
 	}()
 	var user *messages.Message
 	var updates []instructionUpdate
+	if match.Kind == session.Continue && !jsonutil.Equal(entry.boundary.Request.System, request.System) {
+		old, _ := messages.Blocks(entry.boundary.Request.System)
+		next, _ := messages.Blocks(request.System)
+		content, _ := json.Marshal(next[len(old):])
+		updates = append(updates, instructionUpdate{Index: len(request.Messages) - len(match.Delta), Role: "system", Content: content})
+	}
 	for i := range match.Delta {
 		if match.Delta[i].Role == "user" && user == nil {
 			user = &match.Delta[i]
@@ -100,9 +110,6 @@ func (a *Adapter) Run(ctx context.Context, request messages.Request, identity se
 		a.mu.Lock()
 		entry.native = n
 		a.mu.Unlock()
-		// Restored instruction servers already contain all verified updates,
-		// including this request's new system messages.
-		updates = nil
 	}
 	// Reject malformed tool continuations before replacing the accepted boundary
 	// or touching the original MCP waiters. Validation errors preserve the session.
@@ -142,6 +149,7 @@ func (a *Adapter) Run(ctx context.Context, request messages.Request, identity se
 		}
 		return response, err
 	}
+	activeRecord.SystemPrompt, activeRecord.Instructions = n.prompt, n.instructions
 	content, err = json.Marshal(response.Content)
 	if err != nil {
 		return messages.Response{}, protocol()

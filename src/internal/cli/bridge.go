@@ -36,11 +36,13 @@ type toolDefinition struct {
 
 // The MCP handler only waits for a real local result. It never runs a tool.
 type toolCall struct {
-	id     string
-	name   string
-	input  jsontext.Value
-	result chan *mcp.CallToolResult
-	ctx    context.Context
+	id          string
+	name        string
+	input       jsontext.Value
+	result      chan *mcp.CallToolResult
+	ctx         context.Context
+	interrupted atomic.Bool
+	abandon     chan struct{}
 }
 
 type bridge struct {
@@ -62,6 +64,7 @@ type bridge struct {
 	instructionHandlers map[string]*mcp.StreamableHTTPHandler
 	instructionRevision int
 	instructionName     string
+	interruptedIDs      sync.Map
 }
 
 func prepareBridge(request messages.Request, webSearch bool) (*bridge, error) {
@@ -166,7 +169,7 @@ func (b *bridge) start(ctx context.Context, request messages.Request, maxBytes i
 		}
 		s.AddTool(&mcp.Tool{Name: alias, Description: tool.Description, InputSchema: stdjson.RawMessage(tool.InputSchema)}, func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 			id, _ := req.Params.Meta["claudecode/toolUseId"].(string)
-			call := &toolCall{id: id, name: req.Params.Name, input: jsontext.Value(req.Params.Arguments), result: make(chan *mcp.CallToolResult, 1), ctx: ctx}
+			call := &toolCall{id: id, name: req.Params.Name, input: jsontext.Value(req.Params.Arguments), result: make(chan *mcp.CallToolResult, 1), ctx: ctx, abandon: make(chan struct{})}
 			if id == "" || len(id) > 256 || !call.input.IsValid() || call.input.Kind() != '{' {
 				b.fail(protocol())
 				return nil, errors.New("invalid native tool call")
@@ -174,7 +177,10 @@ func (b *bridge) start(ctx context.Context, request messages.Request, maxBytes i
 			select {
 			case b.calls <- call:
 			case <-ctx.Done():
-				b.fail(protocol())
+				_, interrupted := b.interruptedIDs.Load(call.id)
+				if !call.interrupted.Load() && !interrupted {
+					b.fail(protocol())
+				}
 				return nil, errors.New("native tool connection lost")
 			case <-b.ctx.Done():
 				return nil, errors.New("session closed")
@@ -183,8 +189,13 @@ func (b *bridge) start(ctx context.Context, request messages.Request, maxBytes i
 			case result := <-call.result:
 				return result, nil
 			case <-ctx.Done():
-				b.fail(Failure("MCP_CONNECTION_LOST", "tools", "native tool connection was lost; local execution outcome is unknown", 502))
+				_, interrupted := b.interruptedIDs.Load(call.id)
+				if !call.interrupted.Load() && !interrupted {
+					b.fail(Failure("MCP_CONNECTION_LOST", "tools", "native tool connection was lost; local execution outcome is unknown", 502))
+				}
 				return nil, errors.New("native tool connection lost")
+			case <-call.abandon:
+				return nil, errors.New("native wait interrupted for committed compaction")
 			case <-b.ctx.Done():
 				return nil, errors.New("session closed")
 			}

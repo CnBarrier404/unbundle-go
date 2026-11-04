@@ -91,14 +91,19 @@ type Candidate struct {
 	Request        messages.Request
 	Assistant      messages.Message
 	ConfigMismatch bool
+	Compaction     *Compaction
+	CompactRetry   bool
+	RebasedDelta   []messages.Message
 }
 
 type Kind string
 
 const (
-	New      Kind = "new"
-	Continue Kind = "continue"
-	Retry    Kind = "retry"
+	New          Kind = "new"
+	Continue     Kind = "continue"
+	Retry        Kind = "retry"
+	Compact      Kind = "compact"
+	CompactRetry Kind = "compact_retry"
 )
 
 type Match struct {
@@ -121,8 +126,9 @@ func Resolve(incoming messages.Request, identity Identity, candidates []Candidat
 	if err := incoming.Validate(); err != nil {
 		return Match{}, err
 	}
-	if identity.RequestClass == "compaction" {
-		return Match{}, fail("COMPACTION_UNSUPPORTED")
+	source, compact := CompactionIntent(incoming, identity)
+	if identity.RequestClass == "compaction" && !compact {
+		return Match{}, fail("COMPACTION_REQUEST_INVALID")
 	}
 	var matches []Match
 	identified := false
@@ -135,6 +141,60 @@ func Resolve(incoming messages.Request, identity Identity, candidates []Candidat
 		candidateIdentified := identity.SessionID != ""
 		if candidateIdentified {
 			identified = true
+		}
+		if identity.ParentAgentID != "" && candidate.Identity.ParentAgentID != "" && identity.ParentAgentID != candidate.Identity.ParentAgentID {
+			rejection = "SESSION_IDENTITY_MISMATCH"
+			continue
+		}
+		if compact {
+			if candidateIdentified && candidate.State == Active {
+				return Match{}, fail("SESSION_BUSY")
+			}
+			if candidate.CompactRetry {
+				if candidate.State == Active {
+					return Match{}, fail("SESSION_BUSY")
+				}
+				matches = append(matches, Match{Kind: CompactRetry, CandidateID: candidate.ID})
+				continue
+			}
+			delta, ok := compactSource(candidate, source)
+			if ok {
+				if candidate.ConfigMismatch {
+					rejection = "SESSION_DEPLOYMENT_CHANGED"
+					continue
+				}
+				if candidate.State == Active {
+					return Match{}, fail("SESSION_BUSY")
+				}
+				matches = append(matches, Match{Kind: Compact, CandidateID: candidate.ID, Delta: delta})
+			} else if candidateIdentified {
+				rejection = "COMPACTION_HISTORY_MISMATCH"
+			}
+			continue
+		}
+		if candidate.RebasedDelta != nil {
+			if identity.RequestClass != "" && candidate.Identity.RequestClass != "" && identity.RequestClass != candidate.Identity.RequestClass {
+				rejection = "SESSION_IDENTITY_MISMATCH"
+				continue
+			}
+			if candidate.State == Active {
+				return Match{}, fail("SESSION_BUSY")
+			}
+			if candidate.ConfigMismatch || !compatible(candidate.Request, incoming) {
+				rejection = ConfigurationChange(candidate.Request, incoming)
+				if rejection == "" {
+					rejection = "SESSION_CONFIG_CHANGED"
+				}
+				continue
+			}
+			matches = append(matches, Match{Kind: Continue, CandidateID: candidate.ID, Delta: candidate.RebasedDelta})
+			continue
+		}
+		if candidate.Compaction != nil {
+			if candidateIdentified || len(candidate.Request.Messages) > 0 && prefix(candidate.Request.Messages, incoming.Messages) {
+				rejection = "COMPACTION_RECEIPT_REQUIRED"
+			}
+			continue
 		}
 		sameRequest := jsonutil.Equal(incoming.Messages, candidate.Request.Messages)
 		expected := append(slices.Clone(candidate.Request.Messages), candidate.Assistant)
@@ -174,7 +234,10 @@ func Resolve(incoming messages.Request, identity Identity, candidates []Candidat
 		// A closed boundary still identifies retries and continuations, even if
 		// a retry changes its budget. It never authorizes another CLI startup.
 		if candidate.State != Closed && (candidate.ConfigMismatch || !compatible(candidate.Request, incoming)) {
-			rejection = "SESSION_CONFIG_CHANGED"
+			rejection = ConfigurationChange(candidate.Request, incoming)
+			if rejection == "" {
+				rejection = "SESSION_CONFIG_CHANGED"
+			}
 			continue
 		}
 		if sameRequest {
@@ -199,6 +262,15 @@ func Resolve(incoming messages.Request, identity Identity, candidates []Candidat
 	}
 	if identified {
 		return Match{}, fail("SESSION_HISTORY_MISMATCH")
+	}
+	if compact {
+		return Match{}, fail("COMPACTION_SESSION_REQUIRED")
+	}
+	for _, message := range incoming.Messages {
+		text, _ := Text(message.Content)
+		if message.Role == "user" && strings.HasPrefix(text, SummaryHeader+"\n\n") {
+			return Match{}, fail("COMPACTION_RECEIPT_MISMATCH")
+		}
 	}
 	if !newInput(incoming.Messages) {
 		return Match{}, fail("NATIVE_SESSION_REQUIRED")
@@ -235,15 +307,5 @@ func newInput(delta []messages.Message) bool {
 }
 
 func compatible(a, b messages.Request) bool {
-	if a.CacheTTL != b.CacheTTL {
-		return false
-	}
-	// Streaming and opaque client metadata do not change model semantics.
-	a.Messages = nil
-	b.Messages = nil
-	a.Stream = false
-	b.Stream = false
-	a.Metadata = nil
-	b.Metadata = nil
-	return jsonutil.Equal(a, b)
+	return ConfigurationChange(a, b) == ""
 }

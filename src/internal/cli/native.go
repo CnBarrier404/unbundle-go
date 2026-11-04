@@ -52,6 +52,8 @@ type native struct {
 	instructions    []instructionUpdate
 	id              string
 	initialMessages int
+	prompt          string
+	interrupting    bool
 }
 
 func (r Runner) start(ctx, requestContext context.Context, request messages.Request, b *bridge, resume *session.Checkpoint) (_ *native, err error) {
@@ -66,9 +68,13 @@ func (r Runner) start(ctx, requestContext context.Context, request messages.Requ
 	n.id, n.initialMessages = uuid.NewString(), len(request.Messages)
 	if resume != nil {
 		n.id, n.initialMessages = resume.NativeID, resume.InitialMessages
-		for i, message := range request.Messages[n.initialMessages:] {
-			if message.Role == "system" {
-				n.instructions = append(n.instructions, instructionUpdate{Index: n.initialMessages + i, Role: "system", Content: message.Content})
+		n.instructions = resume.Instructions
+		if resume.SystemPrompt == "" {
+			for i := n.initialMessages; i < min(len(resume.History), len(request.Messages)); i++ {
+				message := request.Messages[i]
+				if message.Role == "system" {
+					n.instructions = append(n.instructions, instructionUpdate{Index: i, Role: "system", Content: message.Content})
+				}
 			}
 		}
 	}
@@ -96,7 +102,7 @@ func (r Runner) start(ctx, requestContext context.Context, request messages.Requ
 		prompt += " The official WebSearch tool is explicitly enabled on the inference server. Use that built-in tool for web searches and include its source links in the answer. All other tools still execute locally through MCP."
 	}
 	instructions := []jsontext.Value{request.System}
-	for _, message := range request.Messages[:n.initialMessages] {
+	for _, message := range request.Messages[:min(n.initialMessages, len(request.Messages))] {
 		if message.Role == "system" {
 			instructions = append(instructions, message.Content)
 		}
@@ -112,6 +118,10 @@ func (r Runner) start(ctx, requestContext context.Context, request messages.Requ
 			prompt += "\n\n" + *text.Text
 		}
 	}
+	if resume != nil && resume.SystemPrompt != "" {
+		prompt = resume.SystemPrompt
+	}
+	n.prompt = prompt
 	promptFile := filepath.Join(n.work, "system.txt")
 	if os.WriteFile(promptFile, []byte(prompt), 0600) != nil {
 		return nil, Failure("CLI_PROMPT_FAILED", "startup", "could not prepare inference instructions", 503)
@@ -192,6 +202,7 @@ func (r Runner) start(ctx, requestContext context.Context, request messages.Requ
 		return nil, Failure("CLI_START_FAILED", "startup", "could not start the official CLI", 503)
 	}
 	go n.read(stdout)
+	n.p = n.parser(request.Model, nil)
 	go func() {
 		<-ctx.Done()
 		b.close()
@@ -697,10 +708,10 @@ func addUsage(a, b messages.Usage) (u messages.Usage) {
 func usageDifference(total, accounted messages.Usage) (u messages.Usage, err error) {
 	x, y := usageFields(&total), usageFields(&accounted)
 	for i, field := range usageFields(&u) {
+		if *x[i] != nil && **x[i] < 0 || *y[i] != nil && **y[i] < 0 {
+			return u, protocol()
+		}
 		if *x[i] != nil && *y[i] != nil {
-			if **x[i] < 0 {
-				return u, protocol()
-			}
 			value := **x[i] - **y[i]
 			if value < 0 {
 				return u, protocol()

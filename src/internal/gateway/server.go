@@ -172,7 +172,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.Method == http.MethodGet && r.URL.Path == messages.StatusPath {
-		_ = s.writeJSON(w, 200, map[string]any{"status": "ok", "stage": "native_checkpoints", "session_capacity": s.config.Runtime.MaxSessions, "busy": len(s.active) == cap(s.active), "http_active_requests": len(s.active), "sessions": s.runner.Status(), "cli_version": s.config.CLI.Version, "upstream_auth": "not_checked", "inference": "not_checked"})
+		_ = s.writeJSON(w, 200, map[string]any{"status": "ok", "stage": "native_compaction", "session_capacity": s.config.Runtime.MaxSessions, "busy": len(s.active) == cap(s.active), "http_active_requests": len(s.active), "sessions": s.runner.Status(), "cli_version": s.config.CLI.Version, "upstream_auth": "not_checked", "inference": "not_checked"})
 		return
 	}
 	if r.Method == http.MethodGet && r.URL.Path == messages.ModelsPath {
@@ -257,12 +257,15 @@ func (s *Server) infer(w http.ResponseWriter, r *http.Request, request messages.
 			}
 		}
 		recoveryHeaders(w, response.Recovery)
+		if response.Reused {
+			w.Header().Set("X-Unbundle-Response-Reused", "true")
+		}
 		_ = s.writeJSON(w, 200, response)
 		return
 	}
 	// Completion is known after streaming starts. Standard HTTP trailers report
 	// persistence separately from the Anthropic message and its inference result.
-	w.Header().Set("Trailer", "X-Unbundle-Recovery, X-Unbundle-Recovery-Error")
+	w.Header().Set("Trailer", "X-Unbundle-Recovery, X-Unbundle-Recovery-Error, X-Unbundle-Response-Reused")
 	events := make(chan cli.Event) // no unbounded queue between CLI and socket
 	type result struct {
 		response messages.Response
@@ -332,6 +335,9 @@ func (s *Server) infer(w http.ResponseWriter, r *http.Request, request messages.
 				return
 			}
 			recoveryHeaders(w, result.response.Recovery)
+			if result.response.Reused {
+				w.Header().Set("X-Unbundle-Response-Reused", "true")
+			}
 			if err := send("message_delta", map[string]any{"type": "message_delta", "delta": map[string]any{"stop_reason": result.response.StopReason, "stop_sequence": nil}, "usage": result.response.Usage}); err != nil {
 				return
 			}

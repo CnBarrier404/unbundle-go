@@ -146,8 +146,20 @@ func (a *Adapter) acquire(ctx context.Context, request messages.Request, identit
 	var oldest *conversation
 	for _, entry := range a.entries {
 		candidate := entry.boundary
+		lookup := request
+		if source, compact := session.CompactionIntent(request, identity); compact {
+			lookup = source
+		}
 		if len(candidate.Request.Messages) == 0 && entry.checkpoint != nil {
-			candidate = a.store.Materialize(*entry.checkpoint, request, a.Config)
+			candidate = a.store.Materialize(*entry.checkpoint, lookup, a.Config)
+		}
+		if entry.checkpoint != nil && entry.checkpoint.Compaction != nil {
+			view := a.store.Materialize(*entry.checkpoint, request, a.Config)
+			candidate.Compaction, candidate.CompactRetry, candidate.RebasedDelta = view.Compaction, view.CompactRetry, view.RebasedDelta
+			candidate.ConfigMismatch = candidate.ConfigMismatch || view.ConfigMismatch
+		}
+		if entry.busy {
+			candidate.State = session.Active
 		}
 		candidates = append(candidates, candidate)
 		if entry.native != nil || entry.busy {
@@ -200,7 +212,7 @@ func (a *Adapter) acquire(ctx context.Context, request messages.Request, identit
 		err.Retryable = false
 		return nil, match, "", err
 	}
-	if match.Kind == session.New || entry.native == nil {
+	if match.Kind != session.CompactRetry && (match.Kind == session.New || entry.native == nil) {
 		if processes >= a.Config.Runtime.MaxSessions {
 			if oldest != nil && !reclaiming {
 				a.retireLocked(oldest)
@@ -213,9 +225,14 @@ func (a *Adapter) acquire(ctx context.Context, request messages.Request, identit
 		entry = &conversation{boundary: session.Candidate{ID: id, Identity: identity, State: session.Idle, Request: request}, lastUsed: time.Now()}
 		a.entries[id] = entry
 	} else if len(entry.boundary.Request.Messages) == 0 {
-		entry.boundary = a.store.Materialize(*entry.checkpoint, request, a.Config)
+		lookup := request
+		if source, compact := session.CompactionIntent(request, identity); compact && match.Kind != session.CompactRetry {
+			lookup = source
+		}
+		entry.boundary = a.store.Materialize(*entry.checkpoint, lookup, a.Config)
 	}
 	previous := entry.boundary.State
+	entry.boundary.Compaction, entry.boundary.RebasedDelta, entry.boundary.CompactRetry = nil, nil, false
 	entry.busy, entry.boundary.State = true, session.Active
 	a.running.Add(1)
 	return entry, match, previous, nil
