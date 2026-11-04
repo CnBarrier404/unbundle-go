@@ -141,7 +141,11 @@ func (a *Adapter) acquire(ctx context.Context, request messages.Request, identit
 	if err != nil {
 		var boundary *session.Error
 		if errors.As(err, &boundary) {
-			err = validation(boundary.Code, boundary.Code+": request does not match a safe native session boundary")
+			message := boundary.Code + ": request does not match a safe native session boundary"
+			if boundary.Detail != "" {
+				message += " (" + boundary.Detail + ")"
+			}
+			err = validation(boundary.Code, message)
 		}
 		return nil, match, "", err
 	}

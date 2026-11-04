@@ -105,10 +105,13 @@ type Match struct {
 	CandidateID string
 	Delta       []messages.Message
 }
-type Error struct{ Code string }
+type Error struct {
+	Code   string
+	Detail string
+}
 
 func (e *Error) Error() string { return e.Code }
-func fail(code string) error   { return &Error{code} }
+func fail(code string) error   { return &Error{Code: code} }
 
 // Resolve requires a unique verifiable match. A retry is only classified; it
 // must not advance a CLI or redeliver tools without later delivery accounting.
@@ -123,6 +126,7 @@ func Resolve(incoming messages.Request, identity Identity, candidates []Candidat
 	var matches []Match
 	identified := false
 	var rejection string
+	var detail string
 	for _, candidate := range candidates {
 		if identity.SessionID != "" && (candidate.Identity.SessionID != identity.SessionID || candidate.Identity.AgentID != identity.AgentID) {
 			continue
@@ -133,7 +137,9 @@ func Resolve(incoming messages.Request, identity Identity, candidates []Candidat
 		}
 		sameRequest := jsonutil.Equal(incoming.Messages, candidate.Request.Messages)
 		expected := append(slices.Clone(candidate.Request.Messages), candidate.Assistant)
-		continues := candidate.Assistant.Role == "assistant" && len(incoming.Messages) > len(expected) && prefix(expected, incoming.Messages)
+		continues := candidate.Assistant.Role == "assistant" && len(incoming.Messages) > len(expected) &&
+			prefix(candidate.Request.Messages, incoming.Messages) &&
+			assistantReceiptEqual(candidate.Assistant, incoming.Messages[len(candidate.Request.Messages)], candidate.Request.Messages)
 		// Session and agent identify the conversation. Optional hints may be
 		// omitted, but conflicting supplied hints must not create a new one.
 		if identity.RequestClass != "" && candidate.Identity.RequestClass != "" && candidate.Identity.RequestClass != identity.RequestClass ||
@@ -156,6 +162,7 @@ func Resolve(incoming messages.Request, identity Identity, candidates []Candidat
 		if !sameRequest && !continues {
 			if candidateIdentified {
 				rejection = "SESSION_HISTORY_MISMATCH"
+				detail = historyDifference(expected, incoming.Messages)
 			}
 			continue
 		}
@@ -183,7 +190,7 @@ func Resolve(incoming messages.Request, identity Identity, candidates []Candidat
 		return matches[0], nil
 	}
 	if rejection != "" {
-		return Match{}, fail(rejection)
+		return Match{}, &Error{Code: rejection, Detail: detail}
 	}
 	if identified {
 		return Match{}, fail("SESSION_HISTORY_MISMATCH")
