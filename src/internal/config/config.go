@@ -35,6 +35,9 @@ type Config struct {
 }
 
 type Runtime struct {
+	MaxActiveRequests         int   `json:"max_active_requests"`
+	MaxSessions               int   `json:"max_sessions"`
+	MaxSessionRecords         int   `json:"max_session_records"`
 	RequestTimeoutSeconds     int   `json:"request_timeout_seconds"`
 	WriteTimeoutSeconds       int   `json:"write_timeout_seconds"`
 	MaxOutputBytes            int64 `json:"max_output_bytes"`
@@ -63,7 +66,7 @@ func Defaults() Config {
 	return Config{
 		Version: SchemaVersion, Profile: "unbundle-go", Listen: "127.0.0.1:38191",
 		CLI: &CLI{Path: "claude", Version: CLIBaseline}, MaxRequestBytes: DefaultMaxRequestBytes,
-		Runtime: &Runtime{RequestTimeoutSeconds: 300, WriteTimeoutSeconds: 15, MaxOutputBytes: 32 << 20, ToolWaitTimeoutSeconds: 1800, SessionIdleTimeoutSeconds: 600},
+		Runtime: &Runtime{MaxActiveRequests: 5, MaxSessions: 5, MaxSessionRecords: 128, RequestTimeoutSeconds: 300, WriteTimeoutSeconds: 15, MaxOutputBytes: 32 << 20, ToolWaitTimeoutSeconds: 1800, SessionIdleTimeoutSeconds: 600},
 	}
 }
 
@@ -134,6 +137,9 @@ func (c Config) Validate() error {
 	}
 	if c.Runtime.ToolWaitTimeoutSeconds < 1 || c.Runtime.ToolWaitTimeoutSeconds > 86400 || c.Runtime.SessionIdleTimeoutSeconds < 1 || c.Runtime.SessionIdleTimeoutSeconds > 86400 {
 		return fail("runtime session timeouts")
+	}
+	if c.Runtime.MaxActiveRequests < 1 || c.Runtime.MaxActiveRequests > 64 || c.Runtime.MaxSessions < 1 || c.Runtime.MaxSessions > 64 || c.Runtime.MaxSessionRecords < c.Runtime.MaxSessions || c.Runtime.MaxSessionRecords > 1024 {
+		return fail("runtime session capacity")
 	}
 	if len(c.Models) == 0 || len(c.Models) > 100 {
 		return fail("models")

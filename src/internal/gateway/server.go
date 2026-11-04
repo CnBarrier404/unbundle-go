@@ -62,7 +62,7 @@ func New(ctx context.Context, c config.Config) (*Server, error) {
 	if err := runner.CheckVersion(ctx); err != nil {
 		return nil, err
 	}
-	return &Server{config: c, runner: &cli.Adapter{Config: c, Context: ctx}, token: sha256.Sum256([]byte(token)), active: make(chan struct{}, 1)}, nil
+	return &Server{config: c, runner: &cli.Adapter{Config: c, Context: ctx}, token: sha256.Sum256([]byte(token)), active: make(chan struct{}, c.Runtime.MaxActiveRequests)}, nil
 }
 
 func Serve(ctx context.Context, c config.Config) error {
@@ -168,7 +168,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.Method == http.MethodGet && r.URL.Path == messages.StatusPath {
-		_ = s.writeJSON(w, 200, map[string]any{"status": "ok", "stage": "native_local_tools", "session_capacity": 1, "busy": len(s.active) != 0, "cli_version": s.config.CLI.Version, "upstream_auth": "not_checked", "inference": "not_checked"})
+		_ = s.writeJSON(w, 200, map[string]any{"status": "ok", "stage": "native_sessions", "session_capacity": s.config.Runtime.MaxSessions, "busy": len(s.active) == cap(s.active), "http_active_requests": len(s.active), "sessions": s.runner.Status(), "cli_version": s.config.CLI.Version, "upstream_auth": "not_checked", "inference": "not_checked"})
 		return
 	}
 	if r.Method == http.MethodGet && r.URL.Path == messages.ModelsPath {
@@ -213,7 +213,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case s.active <- struct{}{}:
 		defer func() { <-s.active }()
 	default:
-		e := reject("GATEWAY_BUSY", "native inference capacity is occupied", 503)
+		e := reject("GATEWAY_BUSY", "HTTP request capacity is occupied", 503)
 		e.Type, e.Retryable = "overloaded_error", true
 		s.fail(w, e, id)
 		return

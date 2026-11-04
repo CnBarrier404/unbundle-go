@@ -50,12 +50,14 @@ type native struct {
 	instructions []instructionUpdate
 }
 
-func (r Runner) start(ctx context.Context, request messages.Request, b *bridge) (_ *native, err error) {
+func (r Runner) start(ctx, requestContext context.Context, request messages.Request, b *bridge) (_ *native, err error) {
 	model, ok := r.Config.Model(request.Model)
 	if !ok || request.MaxTokens > model.OutputTokenLimit {
 		return nil, Failure("INVALID_MODEL_LIMIT", "validation", "invalid configured model or output limit", 400)
 	}
 	ctx, cancel := context.WithCancel(ctx)
+	stop := context.AfterFunc(requestContext, cancel)
+	defer stop()
 	n := &native{config: r.Config, ctx: ctx, cancel: cancel, bridge: b, lines: make(chan []byte), exit: make(chan error, 1), done: make(chan struct{}), cleaned: make(chan struct{}), pending: make(map[string]*toolCall), expected: make(map[string]block), results: make(map[string]*mcp.CallToolResult), returned: make(map[string]bool), seen: make(map[string]bool)}
 	defer func() {
 		if err != nil {

@@ -78,9 +78,10 @@ const (
 	Idle         State = "idle"
 	WaitingTools State = "waiting_tools"
 	Active       State = "active"
+	Closed       State = "closed"
 )
 
-// Candidate is an in-memory boundary supplied by the future session manager.
+// Candidate is an in-memory boundary supplied by the session manager.
 // Request is the previous accepted request; Assistant is its completed output.
 // It is not an import format, a checkpoint or proof of HTTP tool delivery.
 type Candidate struct {
@@ -130,18 +131,18 @@ func Resolve(incoming messages.Request, identity Identity, candidates []Candidat
 		if candidateIdentified {
 			identified = true
 		}
+		sameRequest := jsonutil.Equal(incoming.Messages, candidate.Request.Messages)
+		expected := append(slices.Clone(candidate.Request.Messages), candidate.Assistant)
+		continues := candidate.Assistant.Role == "assistant" && len(incoming.Messages) > len(expected) && prefix(expected, incoming.Messages)
 		// Session and agent identify the conversation. Optional hints may be
 		// omitted, but conflicting supplied hints must not create a new one.
 		if identity.RequestClass != "" && candidate.Identity.RequestClass != "" && candidate.Identity.RequestClass != identity.RequestClass ||
 			identity.ParentAgentID != "" && candidate.Identity.ParentAgentID != "" && candidate.Identity.ParentAgentID != identity.ParentAgentID {
-			if candidateIdentified {
+			if candidateIdentified || sameRequest || continues || prefix(incoming.Messages, expected) || prefix(candidate.Request.Messages, incoming.Messages) {
 				rejection = "SESSION_IDENTITY_MISMATCH"
 			}
 			continue
 		}
-		sameRequest := jsonutil.Equal(incoming.Messages, candidate.Request.Messages)
-		expected := append(slices.Clone(candidate.Request.Messages), candidate.Assistant)
-		continues := candidate.Assistant.Role == "assistant" && len(incoming.Messages) > len(expected) && prefix(expected, incoming.Messages)
 		if candidate.State == Active && (candidateIdentified || sameRequest || continues || prefix(candidate.Request.Messages, incoming.Messages)) {
 			return Match{}, fail("SESSION_BUSY")
 		}
@@ -149,7 +150,7 @@ func Resolve(incoming messages.Request, identity Identity, candidates []Candidat
 			rejection = "HISTORY_FORK_UNSUPPORTED"
 			continue
 		}
-		if candidate.State != Idle && candidate.State != WaitingTools {
+		if candidate.State != Idle && candidate.State != WaitingTools && candidate.State != Closed {
 			continue
 		}
 		if !sameRequest && !continues {
@@ -158,7 +159,9 @@ func Resolve(incoming messages.Request, identity Identity, candidates []Candidat
 			}
 			continue
 		}
-		if !compatible(candidate.Request, incoming) {
+		// A closed boundary still identifies retries and continuations, even if
+		// a retry changes its budget. It never authorizes another CLI startup.
+		if candidate.State != Closed && !compatible(candidate.Request, incoming) {
 			rejection = "SESSION_CONFIG_CHANGED"
 			continue
 		}
