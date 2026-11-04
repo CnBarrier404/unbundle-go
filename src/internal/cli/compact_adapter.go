@@ -63,6 +63,9 @@ func (a *Adapter) runCompact(ctx context.Context, entry *conversation, match ses
 		a.reapLocked()
 	}()
 	row := *entry.checkpoint
+	if row.PendingTools {
+		return response, validation("PENDING_TOOL_RESULTS_REQUIRED", "submit the real pending tool results before compaction")
+	}
 	if match.Kind == session.CompactRetry {
 		if err := a.store.Verify(row); err != nil {
 			logger.Warn("compaction_checkpoint_verify_failed", logging.Cause(err))
@@ -96,7 +99,7 @@ func (a *Adapter) runCompact(ctx context.Context, entry *conversation, match ses
 			return response, err
 		}
 		lifetime := logging.With(a.ctx, logging.From(a.ctx).With("session_id", entry.boundary.ID))
-		n, err = (Runner{Config: a.Config}).start(lifetime, ctx, base, b, &row)
+		n, err = (Runner{Config: a.Config}).start(lifetime, ctx, base, b, &row, false)
 		if err != nil {
 			return response, err
 		}

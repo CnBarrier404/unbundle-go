@@ -9,8 +9,9 @@ import (
 )
 
 type ImageBlock struct {
-	Type   string `json:"type"`
-	Source struct {
+	Type         string        `json:"type"`
+	CacheControl *CacheControl `json:"cache_control,omitempty"`
+	Source       struct {
 		Type      string `json:"type"`
 		MediaType string `json:"media_type"`
 		Data      string `json:"data"`
@@ -24,8 +25,11 @@ func DecodeImage(raw []byte) ([]byte, string, error) {
 	if err := jsonutil.Object(raw, &image); err != nil {
 		return nil, "", err
 	}
+	if err := validateCache(image.CacheControl); err != nil {
+		return nil, "", err
+	}
 	if image.Type != "image" || image.Source.Type != "base64" || !slices.Contains([]string{"image/png", "image/jpeg", "image/gif", "image/webp"}, image.Source.MediaType) {
-		return nil, "", unsupported("tool_result.content.image.source")
+		return nil, "", unsupported("image.source")
 	}
 	if len(image.Source.Data) > base64.StdEncoding.EncodedLen(4<<20) {
 		return nil, "", invalid("image", "decoded image exceeds 4 MiB")

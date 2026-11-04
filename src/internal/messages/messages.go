@@ -213,6 +213,7 @@ func (r Request) Validate() error {
 			return invalid(field+".content", "must not be empty")
 		}
 		pastResults := false
+		images := 0
 		for _, raw := range blocks {
 			kind, err := blockType(raw)
 			if err != nil {
@@ -224,6 +225,21 @@ func (r Request) Validate() error {
 					return invalid(field, "tool results must precede text")
 				}
 				if err := textBlock(raw); err != nil {
+					return err
+				}
+				pastResults = true
+			case "image":
+				if message.Role != "user" {
+					return invalid(field, "image requires the user role")
+				}
+				if len(pending) > 0 {
+					return invalid(field, "tool results must precede images")
+				}
+				images++
+				if images > 20 {
+					return invalid(field+".content", "too many images")
+				}
+				if _, _, err := DecodeImage(raw); err != nil {
 					return err
 				}
 				pastResults = true

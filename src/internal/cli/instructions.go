@@ -104,9 +104,8 @@ func (n *native) control(ctx context.Context, request any, observers ...func([]b
 			continue
 		}
 		var frame struct {
-			Type      string `json:"type"`
-			ToolUseID string `json:"tool_use_id"`
-			Response  struct {
+			Type     string `json:"type"`
+			Response struct {
 				Subtype   string         `json:"subtype"`
 				RequestID string         `json:"request_id"`
 				Response  jsontext.Value `json:"response"`
@@ -121,7 +120,7 @@ func (n *native) control(ctx context.Context, request any, observers ...func([]b
 				return nil, Failure("CLI_CONTROL_REJECTED", "control", "official CLI rejected the native control request", 502)
 			}
 			return frame.Response.Response, nil
-		case "system", "rate_limit_event":
+		case "system", "rate_limit_event", "tool_progress", "command_lifecycle":
 			if err := n.p.accept(line); err != nil {
 				return nil, err
 			}
@@ -134,10 +133,6 @@ func (n *native) control(ctx context.Context, request any, observers ...func([]b
 			}
 			if err := n.p.accept(line); err != nil {
 				return nil, err
-			}
-		case "tool_progress":
-			if n.expected[frame.ToolUseID].ID == "" {
-				return nil, protocol()
 			}
 		default:
 			return nil, protocol()

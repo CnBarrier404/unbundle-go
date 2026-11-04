@@ -20,7 +20,8 @@ import (
 )
 
 // Checkpoint contains keyed history fingerprints and private caller instructions.
-// Ready is committed only after the official transcript reaches completion.
+// Ready requires a verified native boundary after process exit. PendingTools
+// accepts only real caller receipts for the saved, uncompleted tool batch.
 type Checkpoint struct {
 	ID              string              `json:"id"`
 	Identity        Identity            `json:"identity"`
@@ -31,6 +32,8 @@ type Checkpoint struct {
 	History         []string            `json:"history"`
 	Assistant       string              `json:"assistant,omitempty"`
 	Ready           bool                `json:"ready"`
+	Interrupted     bool                `json:"interrupted,omitempty"`
+	PendingTools    bool                `json:"pending_tools,omitempty"`
 	Snapshot        NativeSnapshot      `json:"snapshot"`
 	SystemPrompt    string              `json:"system_prompt,omitempty"`
 	Instructions    []InstructionUpdate `json:"instructions,omitempty"`
@@ -98,6 +101,9 @@ func (s *Store) Load() ([]Checkpoint, error) {
 			var row Checkpoint
 			if json.Unmarshal(raw, &row) != nil || row.ID != string(id) || uuid.Validate(row.NativeID) != nil || len(row.History) == 0 || row.InitialMessages < 1 || row.InitialMessages > len(row.History) {
 				return errors.New("invalid checkpoint record")
+			}
+			if row.PendingTools && (!row.Ready || row.Interrupted || row.Compaction != nil) {
+				return errors.New("invalid pending tool checkpoint")
 			}
 			if record := row.Compaction; record != nil {
 				if !row.Ready || uuid.Validate(record.Boundary) != nil || record.SummaryLength < 1 || record.SummaryLength > 256<<20 || record.Leading < 0 || record.Leading > len(record.Source) || len(record.Summary) != 64 || len(record.Request) != 64 || record.ResponseID == "" {
@@ -208,8 +214,7 @@ func (s *Store) Materialize(row Checkpoint, incoming messages.Request, c config.
 		}
 	}
 	for i := 0; i < min(len(row.History), len(incoming.Messages)); i++ {
-		value, err := s.digest(incoming.Messages[i])
-		if err != nil || value != row.History[i] {
+		if !s.messageMatches(row.History[i], incoming.Messages[i]) {
 			return view
 		}
 	}
@@ -230,8 +235,7 @@ func (s *Store) Materialize(row Checkpoint, incoming messages.Request, c config.
 	view.ConfigMismatch = s.configurationMismatch(row, incoming, c)
 	if len(incoming.Messages) > len(row.History) {
 		message := incoming.Messages[len(row.History)]
-		value, err := s.digest(message)
-		if err == nil && value == row.Assistant {
+		if s.messageMatches(row.Assistant, message) {
 			view.Assistant = message
 		}
 	}

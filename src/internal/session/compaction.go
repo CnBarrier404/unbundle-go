@@ -116,7 +116,7 @@ func compactSource(candidate Candidate, source messages.Request) ([]messages.Mes
 	}
 	// Desktop may summarize the last completed API input. The authoritative
 	// final assistant is already in the native session and is not replayed.
-	return nil, candidate.State != WaitingTools && jsonutil.Equal(source.Messages, candidate.Request.Messages)
+	return nil, candidate.State != WaitingTools && len(source.Messages) == len(candidate.Request.Messages) && prefix(candidate.Request.Messages, source.Messages)
 }
 
 func (s *Store) requestDigest(r messages.Request) (string, error) {
@@ -139,8 +139,7 @@ func (s *Store) CompactedDelta(record *Compaction, incoming messages.Request) ([
 		return nil, false
 	}
 	for i := 0; i < start; i++ {
-		digest, err := s.digest(incoming.Messages[i])
-		if err != nil || digest != record.Source[i] {
+		if !s.messageMatches(record.Source[i], incoming.Messages[i]) {
 			return nil, false
 		}
 	}
@@ -166,8 +165,7 @@ func (s *Store) CompactedDelta(record *Compaction, incoming messages.Request) ([
 	for count := min(len(record.Source), len(remaining)); count > 0; count-- {
 		match := true
 		for i := 0; i < count; i++ {
-			digest, err := s.digest(remaining[i])
-			if err != nil || digest != record.Source[len(record.Source)-count+i] {
+			if !s.messageMatches(record.Source[len(record.Source)-count+i], remaining[i]) {
 				match = false
 				break
 			}

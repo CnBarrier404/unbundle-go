@@ -16,7 +16,7 @@ var environmentHeader = regexp.MustCompile(`^\s*(?:<total_tokens>[0-9]+ tokens l
 // Match that receipt only against the caller directory known BEFORE the call.
 // This never changes the native call, submits history or executes a command.
 func assistantReceiptEqual(expected, actual messages.Message, preceding []messages.Message) bool {
-	if jsonutil.Equal(expected, actual) {
+	if messageEqual(expected, actual) {
 		return true
 	}
 	if expected.Role != "assistant" || actual.Role != "assistant" || expected.Content.Kind() != '[' || actual.Content.Kind() != '[' {

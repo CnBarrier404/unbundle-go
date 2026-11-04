@@ -25,6 +25,7 @@ type Error struct {
 	Outcome   string         `json:"outcome"`
 	Usage     messages.Usage `json:"usage"`
 	Status    int            `json:"-"`
+	location  string
 }
 
 func (e *Error) Error() string { return e.Code + ": " + e.Message }

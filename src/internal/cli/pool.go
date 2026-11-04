@@ -26,6 +26,7 @@ type Adapter struct {
 	closed    bool
 	closeDone chan struct{}
 	store     *session.Store
+	auxiliary int
 }
 
 type conversation struct {
@@ -105,7 +106,7 @@ func (a *Adapter) Status() PoolStatus {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.reapLocked()
-	status := PoolStatus{Capacity: a.Config.Runtime.MaxSessions, RequestLimit: a.Config.Runtime.MaxActiveRequests, RecordLimit: a.Config.Runtime.MaxSessionRecords, Records: len(a.entries)}
+	status := PoolStatus{Capacity: a.Config.Runtime.MaxSessions, RequestLimit: a.Config.Runtime.MaxActiveRequests, RecordLimit: a.Config.Runtime.MaxSessionRecords, Records: len(a.entries), Processes: a.auxiliary}
 	for _, entry := range a.entries {
 		if entry.checkpoint != nil && entry.checkpoint.Ready {
 			status.Checkpoints++
@@ -145,7 +146,7 @@ func (a *Adapter) acquire(ctx context.Context, request messages.Request, identit
 	}
 	a.reapLocked()
 	candidates := make([]session.Candidate, 0, len(a.entries))
-	processes, active := 0, 0
+	processes, active := a.auxiliary, 0
 	reclaiming := false
 	var oldest *conversation
 	for _, entry := range a.entries {
@@ -183,6 +184,7 @@ func (a *Adapter) acquire(ctx context.Context, request messages.Request, identit
 	if err != nil {
 		var boundary *session.Error
 		if errors.As(err, &boundary) {
+			logging.From(ctx).Warn("session_boundary_rejected", "error_code", boundary.Code, "detail", boundary.Detail)
 			message := boundary.Code + ": request does not match a safe native session boundary"
 			if boundary.Detail != "" {
 				message += " (" + boundary.Detail + ")"

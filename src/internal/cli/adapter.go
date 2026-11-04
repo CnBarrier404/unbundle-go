@@ -24,6 +24,9 @@ func (a *Adapter) Run(ctx context.Context, request messages.Request, identity se
 	if err := ValidateTurn(request); err != nil {
 		return response, err
 	}
+	if kind := session.AuxiliaryIntent(request); kind != "" {
+		return a.runAuxiliary(ctx, request, identity, kind, emit)
+	}
 	entry, match, previous, err := a.acquire(ctx, request, identity)
 	if err != nil {
 		return response, err
@@ -45,12 +48,31 @@ func (a *Adapter) Run(ctx context.Context, request messages.Request, identity se
 	// The reservation gives this request exclusive ownership of native protocol
 	// state. Pool locks protect only boundaries and resource accounting.
 	n := entry.native
+	previousBoundary, previousCheckpoint := entry.boundary, entry.checkpoint
+	previousBoundary.State = previous
 	started := n == nil
 	accepted := false
 	var content jsontext.Value
+	var activeRecord session.Checkpoint
 	defer func() {
 		if n != nil && (accepted && err != nil || !accepted && started || a.ctx.Err() != nil) {
 			n.close() // never wait for process or MCP cleanup under the pool lock
+		}
+		var interrupted *session.Checkpoint
+		restored := false
+		// A failed control/input step may never reach the native transcript.
+		// Reuse the old boundary only after process exit and an exact check;
+		// never roll back committed user messages, tool results or model output.
+		if accepted && err != nil && previous == session.Idle && previousCheckpoint != nil && previousCheckpoint.Ready && a.store.Verify(*previousCheckpoint) == nil {
+			if saveErr := a.store.Put(*previousCheckpoint); saveErr == nil {
+				restored = true
+				logger.Info("unchanged_checkpoint_restored")
+			} else {
+				logger.Error("checkpoint_restore_failed", logging.Cause(saveErr))
+			}
+		}
+		if accepted && err != nil && errors.Is(ctx.Err(), context.Canceled) && a.ctx.Err() == nil {
+			interrupted = a.saveInterrupted(n, activeRecord, request)
 		}
 		a.mu.Lock()
 		defer a.mu.Unlock()
@@ -64,6 +86,18 @@ func (a *Adapter) Run(ctx context.Context, request messages.Request, identity se
 			entry.boundary.State = previous
 		} else if err != nil {
 			entry.boundary.State = session.Closed
+			if restored {
+				entry.boundary, entry.checkpoint = previousBoundary, previousCheckpoint
+				entry.failure = nil
+				return
+			}
+			if interrupted != nil {
+				entry.checkpoint = interrupted
+				entry.boundary.Assistant = session.InterruptionReceipt()
+				entry.boundary.State = session.Idle
+				entry.failure = nil
+				return
+			}
 			var failure *Error
 			if errors.As(err, &failure) {
 				failure.Usage = n.currentUsage
@@ -104,11 +138,19 @@ func (a *Adapter) Run(ctx context.Context, request messages.Request, identity se
 	}
 	if started {
 		var resume *session.Checkpoint
+		var receipts map[string]bool
 		if match.Kind != session.New {
 			resume = entry.checkpoint
 			if err := a.store.Verify(*resume); err != nil {
 				logger.Warn("checkpoint_verify_failed", logging.Cause(err))
 				return response, validation("NATIVE_CHECKPOINT_CHANGED", "native completion checkpoint is unavailable or changed")
+			}
+			if resume.PendingTools {
+				var err error
+				receipts, err = resumedToolReceipts(entry.boundary.Assistant, *user)
+				if err != nil {
+					return response, err
+				}
 			}
 		}
 		model, _ := a.Config.Model(request.Model)
@@ -117,10 +159,11 @@ func (a *Adapter) Run(ctx context.Context, request messages.Request, identity se
 			return response, err
 		}
 		lifetime := logging.With(a.ctx, logging.From(a.ctx).With("session_id", entry.boundary.ID))
-		n, err = (Runner{Config: a.Config}).start(lifetime, ctx, request, b, resume)
+		n, err = (Runner{Config: a.Config}).start(lifetime, ctx, request, b, resume, false)
 		if err != nil {
 			return response, err
 		}
+		n.resumedResults = receipts
 		a.mu.Lock()
 		entry.native = n
 		a.mu.Unlock()
@@ -145,7 +188,7 @@ func (a *Adapter) Run(ctx context.Context, request messages.Request, identity se
 	if binding.ParentAgentID == "" {
 		binding.ParentAgentID = identity.ParentAgentID
 	}
-	activeRecord, err := a.store.Active(entry.boundary.ID, binding, n.id, n.initialMessages, request, a.Config)
+	activeRecord, err = a.store.Active(entry.boundary.ID, binding, n.id, n.initialMessages, request, a.Config)
 	if err != nil {
 		logger.Error("checkpoint_consume_failed", logging.Cause(err))
 		failure := Failure("CHECKPOINT_CONSUME_FAILED", "checkpoint", "could not commit the new boundary; no input or tool result was submitted", 503)
@@ -190,7 +233,9 @@ func (a *Adapter) Run(ctx context.Context, request messages.Request, identity se
 		}
 	}
 	logger.Debug("checkpoint_state", "recovery", response.Recovery.State)
-	if *response.StopReason == messages.StopMaxTokens || *response.StopReason == messages.StopRefusal {
+	if response.Recovery.State == "ready" || *response.StopReason == messages.StopMaxTokens || *response.StopReason == messages.StopRefusal {
+		// Tool waiters need a live process. Completed turns resume from their
+		// verified native checkpoint, with fresh stream and accounting state.
 		n.close()
 	} else {
 		n.armIdle(*response.StopReason)

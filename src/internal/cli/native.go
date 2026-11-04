@@ -27,25 +27,26 @@ import (
 // native owns one CLI and its original MCP waiters across HTTP requests.
 // Only advance mutates its protocol state; readers/handlers use bounded channels.
 type native struct {
-	config    config.Config
-	ctx       context.Context
-	cancel    context.CancelFunc
-	cmd       *exec.Cmd
-	stdin     io.WriteCloser
-	work      string
-	bridge    *bridge
-	lines     chan []byte
-	exit      chan error
-	done      chan struct{}
-	cleaned   chan struct{}
-	closeOnce sync.Once
-	timer     *time.Timer
-	p         *parser
-	pending   map[string]*toolCall
-	expected  map[string]block
-	results   map[string]*mcp.CallToolResult
-	returned  map[string]bool
-	seen      map[string]bool
+	config         config.Config
+	ctx            context.Context
+	cancel         context.CancelFunc
+	cmd            *exec.Cmd
+	stdin          io.WriteCloser
+	work           string
+	bridge         *bridge
+	lines          chan []byte
+	exit           chan error
+	done           chan struct{}
+	cleaned        chan struct{}
+	closeOnce      sync.Once
+	timer          *time.Timer
+	p              *parser
+	pending        map[string]*toolCall
+	expected       map[string]block
+	results        map[string]*mcp.CallToolResult
+	returned       map[string]bool
+	resumedResults map[string]bool
+	seen           map[string]bool
 	// Previous assistant usage in the current CLI agent loop. Its terminal
 	// result is cumulative; subtract previously reported HTTP tool boundaries.
 	accounted       messages.Usage
@@ -60,7 +61,7 @@ type native struct {
 	diagnostics     diagnosticCount
 }
 
-func (r Runner) start(ctx, requestContext context.Context, request messages.Request, b *bridge, resume *session.Checkpoint) (_ *native, err error) {
+func (r Runner) start(ctx, requestContext context.Context, request messages.Request, b *bridge, resume *session.Checkpoint, fork bool) (_ *native, err error) {
 	model, ok := r.Config.Model(request.Model)
 	if !ok || request.MaxTokens > model.OutputTokenLimit {
 		return nil, Failure("INVALID_MODEL_LIMIT", "validation", "invalid configured model or output limit", 400)
@@ -71,7 +72,10 @@ func (r Runner) start(ctx, requestContext context.Context, request messages.Requ
 	n := &native{config: r.Config, ctx: ctx, cancel: cancel, bridge: b, lines: make(chan []byte), exit: make(chan error, 1), done: make(chan struct{}), cleaned: make(chan struct{}), pending: make(map[string]*toolCall), expected: make(map[string]block), results: make(map[string]*mcp.CallToolResult), returned: make(map[string]bool), seen: make(map[string]bool)}
 	n.id, n.initialMessages = uuid.NewString(), len(request.Messages)
 	if resume != nil {
-		n.id, n.initialMessages = resume.NativeID, resume.InitialMessages
+		if !fork {
+			n.id = resume.NativeID
+		}
+		n.initialMessages = resume.InitialMessages
 		n.instructions = resume.Instructions
 		if resume.SystemPrompt == "" {
 			for i := n.initialMessages; i < min(len(resume.History), len(request.Messages)); i++ {
@@ -181,7 +185,10 @@ func (r Runner) start(ctx, requestContext context.Context, request messages.Requ
 	if resume == nil {
 		args = append(args, "--session-id", n.id)
 	} else {
-		args = append(args, "--resume", n.id)
+		args = append(args, "--resume", resume.NativeID)
+		if fork {
+			args = append(args, "--fork-session", "--session-id", n.id, "--no-session-persistence")
+		}
 	}
 	if len(b.names) > 0 {
 		allowed := "mcp__" + mcpServerName + "__*"
@@ -319,29 +326,9 @@ func (n *native) parser(model string, emit func(Event) error) *parser {
 }
 
 func (n *native) receiveResults(delta messages.Message) error {
-	blocks, err := messages.Blocks(delta.Content)
+	results, err := toolContinuation(delta, n.expected)
 	if err != nil {
 		return err
-	}
-	// Additional user text cannot be silently appended to a tool result. Its
-	// separate native input/control boundary is a later capability.
-	if len(blocks) != len(n.expected) {
-		return &messages.Error{Code: "UNSUPPORTED_PARAMETER", Field: "tool_result", Message: "tool continuation requires exactly the pending results without additional user text"}
-	}
-	results := make(map[string]*mcp.CallToolResult)
-	for _, raw := range blocks {
-		var receipt messages.ToolResultBlock
-		if json.Unmarshal(raw, &receipt) != nil || receipt.Type != "tool_result" || n.expected[receipt.ToolUseID].ID == "" {
-			return protocol()
-		}
-		result, err := toolResult(receipt)
-		if err != nil {
-			return err
-		}
-		results[receipt.ToolUseID] = result
-	}
-	if len(results) != len(n.expected) {
-		return protocol()
 	}
 	n.results = results
 	n.logger.Debug("tool_results_validated", "count", len(results))
@@ -451,6 +438,10 @@ func (n *native) advance(ctx context.Context, request messages.Request, delta me
 		if err := n.input(delta); err != nil {
 			return response, err
 		}
+		for id := range n.resumedResults {
+			n.returned[id] = true // real caller receipts submitted through native input
+		}
+		n.resumedResults = nil
 	}
 	var output int64
 	searching := false
@@ -517,8 +508,6 @@ func (n *native) advance(ctx context.Context, request messages.Request, delta me
 			}
 			var frame struct {
 				Type          string         `json:"type"`
-				ToolUseID     string         `json:"tool_use_id"`
-				ToolName      string         `json:"tool_name"`
 				ToolUseResult jsontext.Value `json:"tool_use_result"`
 				Message       struct {
 					ID      string         `json:"id"`
@@ -532,18 +521,6 @@ func (n *native) advance(ctx context.Context, request messages.Request, delta me
 				} `json:"event"`
 			}
 			if json.Unmarshal(line, &frame) != nil {
-				return response, protocol()
-			}
-			if frame.Type == "tool_progress" {
-				if searching && n.webPending[frame.ToolUseID] && frame.ToolName == "WebSearch" {
-					continue
-				}
-				if expected := n.expected[frame.ToolUseID]; expected.ID != "" && frame.ToolName == expected.Name {
-					continue
-				}
-				if call := n.pending[frame.ToolUseID]; call != nil && frame.ToolName == "mcp__"+mcpServerName+"__"+call.name {
-					continue
-				}
 				return response, protocol()
 			}
 			if frame.Type == "result" {

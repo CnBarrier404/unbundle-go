@@ -64,7 +64,7 @@ func (s *Store) Snapshot(ctx context.Context, nativeID, assistantID string, cont
 	deadline := time.NewTimer(2 * time.Second)
 	defer deadline.Stop()
 	for {
-		snapshot, err := s.snapshot(nativeID, assistantID, content)
+		snapshot, err := s.snapshot(nativeID, "assistant", assistantID, content)
 		if err == nil {
 			return snapshot, nil
 		}
@@ -78,7 +78,14 @@ func (s *Store) Snapshot(ctx context.Context, nativeID, assistantID string, cont
 	}
 }
 
-func (s *Store) snapshot(nativeID, assistantID string, content []jsontext.Value) (NativeSnapshot, error) {
+// SnapshotInput is used only after a canceled CLI has exited. It proves the
+// final native conversation row contains the real submitted tool results and
+// that no later assistant output would be lost by resuming that boundary.
+func (s *Store) SnapshotInput(nativeID string, content []jsontext.Value) (NativeSnapshot, error) {
+	return s.snapshot(nativeID, "user", "", content)
+}
+
+func (s *Store) snapshot(nativeID, role, assistantID string, content []jsontext.Value) (NativeSnapshot, error) {
 	root, err := nativeProjects()
 	if err != nil {
 		return NativeSnapshot{}, err
@@ -100,7 +107,7 @@ func (s *Store) snapshot(nativeID, assistantID string, content []jsontext.Value)
 		if err != nil {
 			return NativeSnapshot{}, err
 		}
-		snapshot, err := s.scanCompletion(file, assistantID, content)
+		snapshot, err := s.scanBoundary(file, role, assistantID, content)
 		if err == nil {
 			err = file.Sync()
 		}
@@ -114,13 +121,13 @@ func (s *Store) snapshot(nativeID, assistantID string, content []jsontext.Value)
 	return NativeSnapshot{}, errors.New("native transcript is not committed")
 }
 
-func (s *Store) scanCompletion(file io.Reader, assistantID string, content []jsontext.Value) (NativeSnapshot, error) {
+func (s *Store) scanBoundary(file io.Reader, role, assistantID string, content []jsontext.Value) (NativeSnapshot, error) {
 	h := hmac.New(sha256.New, s.key)
 	scanner := transcriptLines(file)
 	var total int64
 	var collected []jsontext.Value
 	var snapshot NativeSnapshot
-	lastAssistant := false
+	lastBoundary := false
 	for scanner.Scan() {
 		line := scanner.Bytes()
 		total += int64(len(line))
@@ -130,9 +137,9 @@ func (s *Store) scanCompletion(file io.Reader, assistantID string, content []jso
 			return snapshot, errors.New("invalid native transcript")
 		}
 		if row.Type == "user" || row.Type == "assistant" {
-			lastAssistant = false
+			lastBoundary = false
 		}
-		if row.Type != "assistant" {
+		if row.Type != role {
 			continue
 		}
 		var message struct {
@@ -142,13 +149,17 @@ func (s *Store) scanCompletion(file io.Reader, assistantID string, content []jso
 		if json.Unmarshal(row.Message, &message) != nil {
 			return snapshot, errors.New("invalid native assistant record")
 		}
-		lastAssistant = message.ID == assistantID
-		if lastAssistant {
+		lastBoundary = role == "user" || message.ID == assistantID
+		if lastBoundary {
 			blocks, err := messages.Blocks(message.Content)
 			if err != nil {
 				return snapshot, err
 			}
-			collected = append(collected, blocks...)
+			if role == "user" {
+				collected = blocks
+			} else {
+				collected = append(collected, blocks...)
+			}
 			if jsonutil.Equal(collected, content) {
 				snapshot.Length, snapshot.Digest = total, hex.EncodeToString(h.Sum(nil))
 			}
@@ -157,7 +168,7 @@ func (s *Store) scanCompletion(file io.Reader, assistantID string, content []jso
 	if err := scanner.Err(); err != nil {
 		return snapshot, err
 	}
-	if snapshot.Length == 0 || !lastAssistant || !jsonutil.Equal(collected, content) {
+	if snapshot.Length == 0 || !lastBoundary || !jsonutil.Equal(collected, content) {
 		return snapshot, errors.New("native completion boundary not found")
 	}
 	return snapshot, nil

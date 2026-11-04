@@ -14,7 +14,7 @@ import (
 func historyDifference(expected, actual []messages.Message) string {
 	for i := 0; i < min(len(expected), len(actual)); i++ {
 		left, right := expected[i], actual[i]
-		if jsonutil.Equal(left, right) {
+		if messageEqual(left, right) {
 			continue
 		}
 		field := "message options"

@@ -8,7 +8,6 @@ import (
 	"slices"
 	"strings"
 
-	"unbundle-go/src/internal/jsonutil"
 	"unbundle-go/src/internal/messages"
 )
 
@@ -196,7 +195,7 @@ func Resolve(incoming messages.Request, identity Identity, candidates []Candidat
 			}
 			continue
 		}
-		sameRequest := jsonutil.Equal(incoming.Messages, candidate.Request.Messages)
+		sameRequest := len(incoming.Messages) == len(candidate.Request.Messages) && prefix(candidate.Request.Messages, incoming.Messages)
 		expected := append(slices.Clone(candidate.Request.Messages), candidate.Assistant)
 		continues := candidate.Assistant.Role == "assistant" && len(incoming.Messages) > len(expected) &&
 			prefix(candidate.Request.Messages, incoming.Messages) &&
@@ -283,7 +282,7 @@ func prefix(a, b []messages.Message) bool {
 		return false
 	}
 	for i := range a {
-		if !jsonutil.Equal(a[i], b[i]) {
+		if !messageEqual(a[i], b[i]) {
 			return false
 		}
 	}

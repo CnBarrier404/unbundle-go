@@ -4,6 +4,8 @@ import (
 	"encoding/json/jsontext"
 	"encoding/json/v2"
 	"net/http"
+	"runtime"
+	"strconv"
 	"strings"
 
 	"unbundle-go/src/internal/jsonutil"
@@ -63,7 +65,13 @@ type parser struct {
 }
 
 func protocol() *Error {
-	return Failure("CLI_PROTOCOL_ERROR", "output", "official CLI returned an unsupported or inconsistent event", 502)
+	err := Failure("CLI_PROTOCOL_ERROR", "output", "official CLI returned an unsupported or inconsistent event", 502)
+	if pc, _, line, ok := runtime.Caller(1); ok {
+		if function := runtime.FuncForPC(pc); function != nil {
+			err.location = function.Name() + ":" + strconv.Itoa(line)
+		}
+	}
+	return err
 }
 
 func (p *parser) send(kind string, data any) error {
@@ -249,6 +257,12 @@ func (p *parser) accept(line []byte) error {
 	if json.Unmarshal(line, &frame) != nil {
 		return protocol()
 	}
+	switch frame.Type {
+	case "rate_limit_event", "tool_progress", "command_lifecycle":
+		// Advisory notifications can arrive late and use display names. They
+		// authorize no execution, receipt, stream transition or completion.
+		return nil
+	}
 	if frame.ParentToolUseID != nil {
 		return protocol()
 	}
@@ -365,8 +379,6 @@ func (p *parser) accept(line []byte) error {
 		default:
 			return protocol()
 		}
-	case "rate_limit_event":
-		return nil // advisory, not a terminal failure
 	default:
 		return protocol()
 	}

@@ -17,6 +17,9 @@ func logFailure(logger *slog.Logger, event string, err error) {
 	var invalid *messages.Error
 	if errors.As(err, &failure) {
 		attrs = append(attrs, "error_code", failure.Code, "stage", failure.Stage, "outcome", failure.Outcome)
+		if failure.location != "" {
+			attrs = append(attrs, "protocol_location", failure.location)
+		}
 		if failure.Status < 500 {
 			level = slog.LevelWarn
 		}
