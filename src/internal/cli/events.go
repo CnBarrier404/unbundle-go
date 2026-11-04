@@ -47,6 +47,7 @@ type wireEvent struct {
 }
 
 type parser struct {
+	nativeID string
 	model    string
 	emit     func(Event) error
 	response messages.Response
@@ -232,6 +233,7 @@ func (p *parser) finish() error {
 func (p *parser) accept(line []byte) error {
 	var frame struct {
 		Type            string           `json:"type"`
+		SessionID       string           `json:"session_id"`
 		Subtype         string           `json:"subtype"`
 		Event           jsontext.Value   `json:"event"`
 		Message         wireMessage      `json:"message"`
@@ -256,6 +258,9 @@ func (p *parser) accept(line []byte) error {
 			return Failure("NATIVE_COMPACTION_UNSUPPORTED", "inference", "native compaction is not supported at this stage", 502)
 		}
 		if frame.Subtype == "init" {
+			if frame.SessionID != p.nativeID {
+				return Failure("CLI_SESSION_ID_MISMATCH", "startup", "official CLI did not confirm the requested native session", 502)
+			}
 			if len(frame.Tools) != len(p.tools) {
 				return Failure("CLI_TOOL_SET_MISMATCH", "startup", "CLI did not load exactly the caller tool set", 502)
 			}
@@ -283,6 +288,9 @@ func (p *parser) accept(line []byte) error {
 		} // incomplete snapshot
 		return p.snapshot(frame.Message)
 	case "result":
+		if frame.SessionID != p.nativeID {
+			return Failure("CLI_SESSION_ID_MISMATCH", "output", "official CLI completed a different native session", 502)
+		}
 		if p.result {
 			return protocol()
 		}

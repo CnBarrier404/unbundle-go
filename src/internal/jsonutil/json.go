@@ -48,19 +48,21 @@ func Object(data []byte, out any) error {
 // Equal ignores object key order and JSON encoding whitespace, but preserves
 // array order, text whitespace and number spellings without float conversion.
 func Equal(a, b any) bool {
-	encode := func(v any) (jsontext.Value, error) {
-		data, err := json.Marshal(v)
-		if err != nil {
-			return nil, err
-		}
-		value := jsontext.Value(data)
-		err = value.Format(jsontext.ReorderRawObjects(true), jsontext.CanonicalizeRawInts(false), jsontext.CanonicalizeRawFloats(false))
-		return value, err
-	}
-	x, err := encode(a)
+	x, err := Canonical(a)
 	if err != nil {
 		return false
 	}
-	y, err := encode(b)
+	y, err := Canonical(b)
 	return err == nil && bytes.Equal(x, y)
+}
+
+// Canonical preserves the same comparison semantics for keyed fingerprints.
+func Canonical(v any) (jsontext.Value, error) {
+	data, err := json.Marshal(v)
+	if err != nil {
+		return nil, err
+	}
+	value := jsontext.Value(data)
+	err = value.Format(jsontext.ReorderRawObjects(true), jsontext.CanonicalizeRawInts(false), jsontext.CanonicalizeRawFloats(false))
+	return value, err
 }

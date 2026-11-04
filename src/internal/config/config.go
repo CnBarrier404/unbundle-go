@@ -27,6 +27,7 @@ type Config struct {
 	Profile         string   `json:"profile"`
 	Listen          string   `json:"listen"`
 	TokenFile       string   `json:"token_file"`
+	StateDir        string   `json:"state_dir"`
 	CLI             *CLI     `json:"cli"`
 	MaxRequestBytes int64    `json:"max_request_bytes"`
 	DefaultModel    string   `json:"default_model"`
@@ -64,7 +65,7 @@ type Model struct {
 
 func Defaults() Config {
 	return Config{
-		Version: SchemaVersion, Profile: "unbundle-go", Listen: "127.0.0.1:38191",
+		Version: SchemaVersion, Profile: "unbundle-go", Listen: "127.0.0.1:38191", StateDir: "data/unbundle-go",
 		CLI: &CLI{Path: "claude", Version: CLIBaseline}, MaxRequestBytes: DefaultMaxRequestBytes,
 		Runtime: &Runtime{MaxActiveRequests: 5, MaxSessions: 5, MaxSessionRecords: 128, RequestTimeoutSeconds: 300, WriteTimeoutSeconds: 15, MaxOutputBytes: 32 << 20, ToolWaitTimeoutSeconds: 1800, SessionIdleTimeoutSeconds: 600},
 	}
@@ -103,6 +104,9 @@ func LoadFile(name string) (Config, error) {
 	if !filepath.IsAbs(c.TokenFile) {
 		c.TokenFile = filepath.Join(filepath.Dir(abs), c.TokenFile)
 	}
+	if !filepath.IsAbs(c.StateDir) {
+		c.StateDir = filepath.Join(filepath.Dir(abs), c.StateDir)
+	}
 	if !filepath.IsAbs(c.CLI.Path) && strings.ContainsAny(c.CLI.Path, `/\`) {
 		c.CLI.Path = filepath.Join(filepath.Dir(abs), c.CLI.Path)
 	}
@@ -123,6 +127,9 @@ func (c Config) Validate() error {
 	}
 	if !plain(c.TokenFile) {
 		return fail("token_file")
+	}
+	if !plain(c.StateDir) {
+		return fail("state_dir")
 	}
 	if c.CLI == nil || !plain(c.CLI.Path) || c.CLI.Version != CLIBaseline {
 		return fail("cli (requires the baseline version 2.1.316)")

@@ -14,10 +14,12 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"unbundle-go/src/internal/config"
 	"unbundle-go/src/internal/messages"
+	"unbundle-go/src/internal/session"
 )
 
 // native owns one CLI and its original MCP waiters across HTTP requests.
@@ -44,13 +46,15 @@ type native struct {
 	seen      map[string]bool
 	// Previous assistant usage in the current CLI agent loop. Its terminal
 	// result is cumulative; subtract previously reported HTTP tool boundaries.
-	accounted    messages.Usage
-	currentUsage messages.Usage
-	webPending   map[string]bool
-	instructions []instructionUpdate
+	accounted       messages.Usage
+	currentUsage    messages.Usage
+	webPending      map[string]bool
+	instructions    []instructionUpdate
+	id              string
+	initialMessages int
 }
 
-func (r Runner) start(ctx, requestContext context.Context, request messages.Request, b *bridge) (_ *native, err error) {
+func (r Runner) start(ctx, requestContext context.Context, request messages.Request, b *bridge, resume *session.Checkpoint) (_ *native, err error) {
 	model, ok := r.Config.Model(request.Model)
 	if !ok || request.MaxTokens > model.OutputTokenLimit {
 		return nil, Failure("INVALID_MODEL_LIMIT", "validation", "invalid configured model or output limit", 400)
@@ -59,6 +63,15 @@ func (r Runner) start(ctx, requestContext context.Context, request messages.Requ
 	stop := context.AfterFunc(requestContext, cancel)
 	defer stop()
 	n := &native{config: r.Config, ctx: ctx, cancel: cancel, bridge: b, lines: make(chan []byte), exit: make(chan error, 1), done: make(chan struct{}), cleaned: make(chan struct{}), pending: make(map[string]*toolCall), expected: make(map[string]block), results: make(map[string]*mcp.CallToolResult), returned: make(map[string]bool), seen: make(map[string]bool)}
+	n.id, n.initialMessages = uuid.NewString(), len(request.Messages)
+	if resume != nil {
+		n.id, n.initialMessages = resume.NativeID, resume.InitialMessages
+		for i, message := range request.Messages[n.initialMessages:] {
+			if message.Role == "system" {
+				n.instructions = append(n.instructions, instructionUpdate{Index: n.initialMessages + i, Role: "system", Content: message.Content})
+			}
+		}
+	}
 	defer func() {
 		if err != nil {
 			cancel()
@@ -68,7 +81,12 @@ func (r Runner) start(ctx, requestContext context.Context, request messages.Requ
 			}
 		}
 	}()
-	n.work, err = os.MkdirTemp("", "unbundle-session-")
+	workRoot := filepath.Join(r.Config.StateDir, "tmp")
+	workspace := filepath.Join(r.Config.StateDir, "workspace")
+	if os.MkdirAll(workRoot, 0700) != nil || os.MkdirAll(workspace, 0700) != nil {
+		return nil, Failure("CLI_WORKDIR_FAILED", "startup", "could not create persistent inference directories", 503)
+	}
+	n.work, err = os.MkdirTemp(workRoot, "session-")
 	if err != nil {
 		return nil, Failure("CLI_WORKDIR_FAILED", "startup", "could not create private inference directory", 503)
 	}
@@ -78,7 +96,7 @@ func (r Runner) start(ctx, requestContext context.Context, request messages.Requ
 		prompt += " The official WebSearch tool is explicitly enabled on the inference server. Use that built-in tool for web searches and include its source links in the answer. All other tools still execute locally through MCP."
 	}
 	instructions := []jsontext.Value{request.System}
-	for _, message := range request.Messages {
+	for _, message := range request.Messages[:n.initialMessages] {
 		if message.Role == "system" {
 			instructions = append(instructions, message.Content)
 		}
@@ -103,6 +121,24 @@ func (r Runner) start(ctx, requestContext context.Context, request messages.Requ
 	if err = b.start(ctx, request, r.Config.MaxRequestBytes, wait); err != nil {
 		return nil, err
 	}
+	if len(n.instructions) > 0 {
+		name, server, err := b.stageInstructions(n.instructions)
+		if err != nil {
+			return nil, err
+		}
+		var cfg struct {
+			Servers map[string]any `json:"mcpServers"`
+		}
+		if json.Unmarshal(b.config, &cfg) != nil {
+			return nil, protocol()
+		}
+		cfg.Servers[name] = server
+		b.config, err = json.Marshal(cfg)
+		if err != nil {
+			return nil, err
+		}
+		b.instructionName = name
+	}
 	mcpFile := filepath.Join(n.work, "mcp.json")
 	if os.WriteFile(mcpFile, b.config, 0600) != nil {
 		return nil, Failure("MCP_CONFIG_FAILED", "startup", "could not prepare private MCP configuration", 503)
@@ -117,7 +153,12 @@ func (r Runner) start(ctx, requestContext context.Context, request messages.Requ
 		// CLI choose its native adaptive mode with thinking explicitly enabled.
 		settings = `{"disableAllHooks":true,"alwaysThinkingEnabled":true}`
 	}
-	args := []string{"-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", "--include-partial-messages", "--tools", builtins, "--strict-mcp-config", "--mcp-config", mcpFile, "--setting-sources", "", "--restricted", "--disable-slash-commands", "--no-chrome", "--permission-mode", "dontAsk", "--permission-prompts", "none", "--settings", settings, "--no-session-persistence", "--model", model.CLIModel, "--system-prompt-file", promptFile}
+	args := []string{"-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", "--include-partial-messages", "--tools", builtins, "--strict-mcp-config", "--mcp-config", mcpFile, "--setting-sources", "", "--restricted", "--disable-slash-commands", "--no-chrome", "--permission-mode", "dontAsk", "--permission-prompts", "none", "--settings", settings, "--model", model.CLIModel, "--system-prompt-file", promptFile, "--system-prompt-snapshot", "on"}
+	if resume == nil {
+		args = append(args, "--session-id", n.id)
+	} else {
+		args = append(args, "--resume", n.id)
+	}
 	if len(b.names) > 0 {
 		allowed := "mcp__" + mcpServerName + "__*"
 		if builtins != "" {
@@ -129,7 +170,7 @@ func (r Runner) start(ctx, requestContext context.Context, request messages.Requ
 		args = append(args, "--effort", request.OutputConfig.Effort)
 	}
 	n.cmd = command(ctx, r.Config.CLI.Path, args...)
-	n.cmd.Dir = n.work
+	n.cmd.Dir = workspace
 	n.cmd.Env = append(n.cmd.Env, fmt.Sprintf("CLAUDE_CODE_MAX_OUTPUT_TOKENS=%d", request.MaxTokens), fmt.Sprintf("MCP_TOOL_TIMEOUT=%d", wait.Milliseconds()), fmt.Sprintf("CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT=%d", wait.Milliseconds()))
 	if request.CacheTTL == "5m" {
 		n.cmd.Env = append(n.cmd.Env, "FORCE_PROMPT_CACHING_5M=1", "CLAUDE_CODE_MESSAGES_PROMPT_CACHE_TTL=5m")
@@ -180,7 +221,7 @@ func (n *native) read(stdout io.ReadCloser) {
 		n.cancel()
 	}
 	waitErr := n.cmd.Wait()
-	err := Failure("CLI_SESSION_EXITED", "exit", "native CLI exited; this process cannot be reconstructed from HTTP history", 502)
+	err := Failure("CLI_SESSION_EXITED", "exit", "native CLI exited before completing this request", 502)
 	if scanErr != nil {
 		err = Failure("CLI_OUTPUT_INVALID", "output", "CLI output was truncated or exceeds the event limit", 502)
 	} else if waitErr != nil {
@@ -230,7 +271,7 @@ func (n *native) parser(model string, emit func(Event) error) *parser {
 	if n.bridge.instructionName != "" {
 		servers[n.bridge.instructionName] = true
 	}
-	return &parser{model: model, emit: emit, tools: n.bridge.names, servers: servers}
+	return &parser{model: model, emit: emit, tools: n.bridge.names, servers: servers, nativeID: n.id}
 }
 
 func (n *native) receiveResults(delta messages.Message) error {
@@ -610,12 +651,15 @@ func (n *native) advance(ctx context.Context, request messages.Request, delta me
 			return messages.Response{}, err
 		}
 	}
+	return response, nil
+}
+
+func (n *native) armIdle(reason string) {
 	wait := n.config.Runtime.SessionIdleTimeoutSeconds
-	if *response.StopReason == messages.StopToolUse {
+	if reason == messages.StopToolUse {
 		wait = n.config.Runtime.ToolWaitTimeoutSeconds
 	}
 	n.timer = time.AfterFunc(time.Duration(wait)*time.Second, n.cancel)
-	return response, nil
 }
 
 func cancelled(ctx context.Context) *Error {

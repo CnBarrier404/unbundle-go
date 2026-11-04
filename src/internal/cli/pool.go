@@ -15,8 +15,7 @@ import (
 // Adapter owns native conversations and their in-memory boundaries. The pool
 // mutex is never held while starting, advancing, or closing a CLI process.
 type Adapter struct {
-	Config  config.Config
-	Context context.Context
+	Config config.Config
 
 	mu        sync.Mutex
 	ctx       context.Context
@@ -25,15 +24,17 @@ type Adapter struct {
 	running   sync.WaitGroup
 	closed    bool
 	closeDone chan struct{}
+	store     *session.Store
 }
 
 type conversation struct {
-	boundary session.Candidate
-	native   *native
-	failure  *Error
-	busy     bool
-	retiring bool
-	lastUsed time.Time
+	boundary   session.Candidate
+	native     *native
+	failure    *Error
+	busy       bool
+	retiring   bool
+	lastUsed   time.Time
+	checkpoint *session.Checkpoint
 }
 
 // PoolStatus contains counts only, never prompts, tool arguments or identities.
@@ -48,17 +49,30 @@ type PoolStatus struct {
 	Idle           int `json:"idle"`
 	Closed         int `json:"closed"`
 	Closing        int `json:"closing"`
+	Checkpoints    int `json:"checkpoints"`
+	Recoverable    int `json:"recoverable"`
 }
 
-func (a *Adapter) initializeLocked() {
-	if a.ctx == nil {
-		parent := a.Context
-		if parent == nil {
-			parent = context.Background()
-		}
-		a.ctx, a.cancel = context.WithCancel(parent)
-		a.entries = make(map[string]*conversation)
+func NewAdapter(ctx context.Context, c config.Config) (*Adapter, error) {
+	store, err := session.OpenStore(c.StateDir)
+	if err != nil {
+		return nil, Failure("CHECKPOINT_STORE_FAILED", "startup", "could not open the private checkpoint store", 503)
 	}
+	rows, err := store.Load()
+	if err != nil {
+		_ = store.Close()
+		return nil, Failure("CHECKPOINT_STORE_INVALID", "startup", "could not load checkpoint records", 503)
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	a := &Adapter{Config: c, ctx: ctx, cancel: cancel, entries: make(map[string]*conversation), store: store}
+	for _, row := range rows {
+		state := session.Closed
+		if row.Ready {
+			state = session.Idle
+		}
+		a.entries[row.ID] = &conversation{boundary: session.Candidate{ID: row.ID, Identity: row.Identity, State: state}, checkpoint: &row}
+	}
+	return a, nil
 }
 
 // Reaping frees process capacity only after native cleanup has finished. The
@@ -75,6 +89,9 @@ func (a *Adapter) reapLocked() {
 			}
 			entry.native = nil
 			entry.boundary.State = session.Closed
+			if entry.checkpoint != nil && entry.checkpoint.Ready {
+				entry.boundary.State = session.Idle
+			}
 		default:
 		}
 	}
@@ -86,6 +103,12 @@ func (a *Adapter) Status() PoolStatus {
 	a.reapLocked()
 	status := PoolStatus{Capacity: a.Config.Runtime.MaxSessions, RequestLimit: a.Config.Runtime.MaxActiveRequests, RecordLimit: a.Config.Runtime.MaxSessionRecords, Records: len(a.entries)}
 	for _, entry := range a.entries {
+		if entry.checkpoint != nil && entry.checkpoint.Ready {
+			status.Checkpoints++
+			if entry.native == nil {
+				status.Recoverable++
+			}
+		}
 		if entry.native != nil || entry.busy {
 			status.Processes++ // includes startup reservations and closing processes
 		}
@@ -110,7 +133,6 @@ func (a *Adapter) Status() PoolStatus {
 func (a *Adapter) acquire(ctx context.Context, request messages.Request, identity session.Identity) (*conversation, session.Match, session.State, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	a.initializeLocked()
 	if a.closed || a.ctx.Err() != nil {
 		return nil, session.Match{}, "", capacity("GATEWAY_CLOSED", "gateway is shutting down")
 	}
@@ -123,7 +145,11 @@ func (a *Adapter) acquire(ctx context.Context, request messages.Request, identit
 	reclaiming := false
 	var oldest *conversation
 	for _, entry := range a.entries {
-		candidates = append(candidates, entry.boundary)
+		candidate := entry.boundary
+		if len(candidate.Request.Messages) == 0 && entry.checkpoint != nil {
+			candidate = a.store.Materialize(*entry.checkpoint, request, a.Config)
+		}
+		candidates = append(candidates, candidate)
 		if entry.native != nil || entry.busy {
 			processes++
 		}
@@ -150,7 +176,10 @@ func (a *Adapter) acquire(ctx context.Context, request messages.Request, identit
 		return nil, match, "", err
 	}
 	entry := a.entries[match.CandidateID]
-	if entry != nil && (entry.retiring || entry.boundary.State == session.Closed || entry.native.ctx.Err() != nil) {
+	if entry != nil && (entry.retiring || entry.native != nil && entry.native.ctx.Err() != nil) && entry.checkpoint != nil && entry.checkpoint.Ready {
+		return nil, match, "", capacity("SESSION_CLEANUP", "native process cleanup must finish before checkpoint recovery")
+	}
+	if entry != nil && (entry.boundary.State == session.Closed || entry.native == nil || entry.native.ctx.Err() != nil) && (entry.checkpoint == nil || !entry.checkpoint.Ready) {
 		err := validation("NATIVE_SESSION_LOST", "native session ended; HTTP history cannot reconstruct it; start a new conversation")
 		if entry.failure != nil {
 			err.Message = "previous turn failed (" + entry.failure.Code + "): " + entry.failure.Message + "; start a new conversation"
@@ -166,21 +195,25 @@ func (a *Adapter) acquire(ctx context.Context, request messages.Request, identit
 	if active >= a.Config.Runtime.MaxActiveRequests {
 		return nil, match, "", capacity("GATEWAY_BUSY", "inference request capacity is occupied")
 	}
-	if match.Kind == session.New {
-		if len(a.entries) >= a.Config.Runtime.MaxSessionRecords {
-			err := capacity("SESSION_RECORD_CAPACITY", "retained session boundary capacity is full; old boundaries cannot be discarded automatically")
-			err.Retryable = false
-			return nil, match, "", err
-		}
+	if match.Kind == session.New && len(a.entries) >= a.Config.Runtime.MaxSessionRecords {
+		err := capacity("SESSION_RECORD_CAPACITY", "retained session boundary capacity is full; old boundaries cannot be discarded automatically")
+		err.Retryable = false
+		return nil, match, "", err
+	}
+	if match.Kind == session.New || entry.native == nil {
 		if processes >= a.Config.Runtime.MaxSessions {
 			if oldest != nil && !reclaiming {
 				a.retireLocked(oldest)
 			}
 			return nil, match, "", capacity("SESSION_CAPACITY", "native process capacity is occupied; any idle reclamation must finish before retrying")
 		}
+	}
+	if match.Kind == session.New {
 		id := rand.Text()
 		entry = &conversation{boundary: session.Candidate{ID: id, Identity: identity, State: session.Idle, Request: request}, lastUsed: time.Now()}
 		a.entries[id] = entry
+	} else if len(entry.boundary.Request.Messages) == 0 {
+		entry.boundary = a.store.Materialize(*entry.checkpoint, request, a.Config)
 	}
 	previous := entry.boundary.State
 	entry.busy, entry.boundary.State = true, session.Active
@@ -197,6 +230,9 @@ func (a *Adapter) retireLocked(entry *conversation) {
 		n.close()
 		a.mu.Lock()
 		entry.native, entry.retiring = nil, false
+		if entry.checkpoint != nil && entry.checkpoint.Ready {
+			entry.boundary.State = session.Idle
+		}
 		a.mu.Unlock()
 		a.running.Done()
 	}()
@@ -210,7 +246,6 @@ func (a *Adapter) Close() {
 		<-done
 		return
 	}
-	a.initializeLocked()
 	a.closed = true
 	a.closeDone = make(chan struct{})
 	a.cancel()
@@ -231,6 +266,7 @@ func (a *Adapter) Close() {
 		go func() { defer cleanup.Done(); n.close() }()
 	}
 	cleanup.Wait()
+	_ = a.store.Close()
 	a.mu.Lock()
 	a.reapLocked()
 	close(a.closeDone)

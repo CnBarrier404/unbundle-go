@@ -85,11 +85,12 @@ const (
 // Request is the previous accepted request; Assistant is its completed output.
 // It is not an import format, a checkpoint or proof of HTTP tool delivery.
 type Candidate struct {
-	ID        string
-	Identity  Identity
-	State     State
-	Request   messages.Request
-	Assistant messages.Message
+	ID             string
+	Identity       Identity
+	State          State
+	Request        messages.Request
+	Assistant      messages.Message
+	ConfigMismatch bool
 }
 
 type Kind string
@@ -144,7 +145,7 @@ func Resolve(incoming messages.Request, identity Identity, candidates []Candidat
 		// omitted, but conflicting supplied hints must not create a new one.
 		if identity.RequestClass != "" && candidate.Identity.RequestClass != "" && candidate.Identity.RequestClass != identity.RequestClass ||
 			identity.ParentAgentID != "" && candidate.Identity.ParentAgentID != "" && candidate.Identity.ParentAgentID != identity.ParentAgentID {
-			if candidateIdentified || sameRequest || continues || prefix(incoming.Messages, expected) || prefix(candidate.Request.Messages, incoming.Messages) {
+			if candidateIdentified || len(candidate.Request.Messages) > 0 && (sameRequest || continues || prefix(incoming.Messages, expected) || prefix(candidate.Request.Messages, incoming.Messages)) {
 				rejection = "SESSION_IDENTITY_MISMATCH"
 			}
 			continue
@@ -162,13 +163,17 @@ func Resolve(incoming messages.Request, identity Identity, candidates []Candidat
 		if !sameRequest && !continues {
 			if candidateIdentified {
 				rejection = "SESSION_HISTORY_MISMATCH"
-				detail = historyDifference(expected, incoming.Messages)
+				if len(candidate.Request.Messages) > 0 {
+					detail = historyDifference(expected, incoming.Messages)
+				} else {
+					detail = "stored history fingerprint mismatch"
+				}
 			}
 			continue
 		}
 		// A closed boundary still identifies retries and continuations, even if
 		// a retry changes its budget. It never authorizes another CLI startup.
-		if candidate.State != Closed && !compatible(candidate.Request, incoming) {
+		if candidate.State != Closed && (candidate.ConfigMismatch || !compatible(candidate.Request, incoming)) {
 			rejection = "SESSION_CONFIG_CHANGED"
 			continue
 		}

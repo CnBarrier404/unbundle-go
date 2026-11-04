@@ -62,7 +62,11 @@ func New(ctx context.Context, c config.Config) (*Server, error) {
 	if err := runner.CheckVersion(ctx); err != nil {
 		return nil, err
 	}
-	return &Server{config: c, runner: &cli.Adapter{Config: c, Context: ctx}, token: sha256.Sum256([]byte(token)), active: make(chan struct{}, c.Runtime.MaxActiveRequests)}, nil
+	adapter, err := cli.NewAdapter(ctx, c)
+	if err != nil {
+		return nil, err
+	}
+	return &Server{config: c, runner: adapter, token: sha256.Sum256([]byte(token)), active: make(chan struct{}, c.Runtime.MaxActiveRequests)}, nil
 }
 
 func Serve(ctx context.Context, c config.Config) error {
@@ -168,7 +172,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.Method == http.MethodGet && r.URL.Path == messages.StatusPath {
-		_ = s.writeJSON(w, 200, map[string]any{"status": "ok", "stage": "native_sessions", "session_capacity": s.config.Runtime.MaxSessions, "busy": len(s.active) == cap(s.active), "http_active_requests": len(s.active), "sessions": s.runner.Status(), "cli_version": s.config.CLI.Version, "upstream_auth": "not_checked", "inference": "not_checked"})
+		_ = s.writeJSON(w, 200, map[string]any{"status": "ok", "stage": "native_checkpoints", "session_capacity": s.config.Runtime.MaxSessions, "busy": len(s.active) == cap(s.active), "http_active_requests": len(s.active), "sessions": s.runner.Status(), "cli_version": s.config.CLI.Version, "upstream_auth": "not_checked", "inference": "not_checked"})
 		return
 	}
 	if r.Method == http.MethodGet && r.URL.Path == messages.ModelsPath {
@@ -252,9 +256,13 @@ func (s *Server) infer(w http.ResponseWriter, r *http.Request, request messages.
 				w.Header().Set("X-Unbundle-Web-Search-Hits", strconv.FormatInt(*evidence.Hits, 10))
 			}
 		}
+		recoveryHeaders(w, response.Recovery)
 		_ = s.writeJSON(w, 200, response)
 		return
 	}
+	// Completion is known after streaming starts. Standard HTTP trailers report
+	// persistence separately from the Anthropic message and its inference result.
+	w.Header().Set("Trailer", "X-Unbundle-Recovery, X-Unbundle-Recovery-Error")
 	events := make(chan cli.Event) // no unbounded queue between CLI and socket
 	type result struct {
 		response messages.Response
@@ -323,11 +331,21 @@ func (s *Server) infer(w http.ResponseWriter, r *http.Request, request messages.
 				}
 				return
 			}
+			recoveryHeaders(w, result.response.Recovery)
 			if err := send("message_delta", map[string]any{"type": "message_delta", "delta": map[string]any{"stop_reason": result.response.StopReason, "stop_sequence": nil}, "usage": result.response.Usage}); err != nil {
 				return
 			}
 			_ = send("message_stop", map[string]string{"type": "message_stop"})
 			return
+		}
+	}
+}
+
+func recoveryHeaders(w http.ResponseWriter, recovery *messages.Recovery) {
+	if recovery != nil {
+		w.Header().Set("X-Unbundle-Recovery", recovery.State)
+		if recovery.Code != "" {
+			w.Header().Set("X-Unbundle-Recovery-Error", recovery.Code)
 		}
 	}
 }

@@ -22,6 +22,12 @@ type Response struct {
 	Usage        Usage            `json:"usage"`
 	// Diagnostic evidence is sent in JSON-response headers, outside Messages.
 	WebSearch *WebSearchEvidence `json:"-"`
+	Recovery  *Recovery          `json:"-"`
+}
+
+type Recovery struct {
+	State string
+	Code  string
 }
 
 type WebSearchEvidence struct {
