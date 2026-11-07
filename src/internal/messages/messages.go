@@ -15,17 +15,18 @@ import (
 )
 
 type Request struct {
-	Model         string         `json:"model"`
-	MaxTokens     int64          `json:"max_tokens"`
-	Messages      []Message      `json:"messages"`
-	System        jsontext.Value `json:"system,omitempty"`
-	Stream        bool           `json:"stream,omitempty"`
-	Tools         []Tool         `json:"tools,omitempty"`
-	ToolChoice    *ToolChoice    `json:"tool_choice,omitempty"`
-	Thinking      *Thinking      `json:"thinking,omitempty"`
-	OutputConfig  *OutputConfig  `json:"output_config,omitempty"`
-	Metadata      *Metadata      `json:"metadata,omitempty"`
-	StopSequences []string       `json:"stop_sequences,omitempty"`
+	Model             string             `json:"model"`
+	MaxTokens         int64              `json:"max_tokens"`
+	Messages          []Message          `json:"messages"`
+	System            jsontext.Value     `json:"system,omitempty"`
+	Stream            bool               `json:"stream,omitempty"`
+	Tools             []Tool             `json:"tools,omitempty"`
+	ToolChoice        *ToolChoice        `json:"tool_choice,omitempty"`
+	Thinking          *Thinking          `json:"thinking,omitempty"`
+	ContextManagement *ContextManagement `json:"context_management,omitempty"`
+	OutputConfig      *OutputConfig      `json:"output_config,omitempty"`
+	Metadata          *Metadata          `json:"metadata,omitempty"`
+	StopSequences     []string           `json:"stop_sequences,omitempty"`
 	// CacheTTL is derived from transport hints. The official CLI owns cache
 	// breakpoints; annotations are removed before native history comparison.
 	CacheTTL string `json:"-"`
@@ -60,7 +61,19 @@ type ToolChoice struct {
 }
 
 type Thinking struct {
+	Type    string `json:"type"`
+	Display string `json:"display,omitempty"`
+}
+
+// The native CLI owns thinking preservation and compaction. Only its default
+// preserve-all policy can be represented without rewriting native history.
+type ContextManagement struct {
+	Edits []ContextEdit `json:"edits"`
+}
+
+type ContextEdit struct {
 	Type string `json:"type"`
+	Keep string `json:"keep"`
 }
 type OutputConfig struct {
 	Effort string `json:"effort"`
@@ -150,6 +163,16 @@ func (r Request) Validate() error {
 	}
 	if r.Thinking != nil && r.Thinking.Type != "adaptive" {
 		return unsupported("thinking")
+	}
+	if r.Thinking != nil && !slices.Contains([]string{"", "updates"}, r.Thinking.Display) {
+		return unsupported("thinking.display")
+	}
+	if r.ContextManagement != nil {
+		for _, edit := range r.ContextManagement.Edits {
+			if edit.Type != "clear_thinking_20251015" || edit.Keep != "all" {
+				return unsupported("context_management.edits: requires preserve-all thinking")
+			}
+		}
 	}
 	if err := validateOutput(r.OutputConfig); err != nil {
 		return err

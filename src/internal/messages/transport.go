@@ -12,9 +12,9 @@ const (
 	StatusPath   = "/status"
 )
 
-// ValidateHeaders defines the initial transport dialect. It deliberately does
-// not authenticate a request. Only markers for the native CLI, thinking blocks
-// and mapped effort are accepted; ?beta=true alone grants no capabilities.
+// ValidateHeaders accepts the capability markers advertised by Claude Code.
+// A marker alone does not activate a feature: Decode and the native adapter
+// still validate its fields and content blocks before starting inference.
 func ValidateHeaders(headers http.Header) error {
 	values := func(name string) []string {
 		var out []string
@@ -32,7 +32,11 @@ func ValidateHeaders(headers http.Header) error {
 	for _, beta := range values("anthropic-beta") {
 		for _, marker := range strings.Split(beta, ",") {
 			switch strings.TrimSpace(marker) {
-			case "", "claude-code-20250219", "interleaved-thinking-2025-05-14", "effort-2025-11-24":
+			case "", "claude-code-20250219", "interleaved-thinking-2025-05-14", "effort-2025-11-24",
+				"context-management-2025-06-27", "per-turn-control-2026-07-01",
+				"mid-conversation-tool-changes-2026-07-01", "inline-tools-2026-09-15",
+				"advisor-tool-2026-03-01", "thinking-token-count-2026-05-13",
+				"advanced-tool-use-2025-11-20", "thinking-display-updates-2026-08-18":
 			default:
 				return &Error{"UNSUPPORTED_BETA", "anthropic-beta", "beta semantics have not been verified by the CLI adapter"}
 			}

@@ -180,6 +180,11 @@ func (r Runner) start(ctx, requestContext context.Context, request messages.Requ
 		// The request validator accepts only adaptive thinking. Let the official
 		// CLI choose its native adaptive mode with thinking explicitly enabled.
 		settings = `{"disableAllHooks":true,"alwaysThinkingEnabled":true}`
+		if request.Thinking.Display == "updates" {
+			// The pinned CLI selects display:updates and its beta header for
+			// supported models when summaries are off and updates are enabled.
+			settings = `{"disableAllHooks":true,"alwaysThinkingEnabled":true,"showThinkingSummaries":false}`
+		}
 	}
 	args := []string{"-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", "--include-partial-messages", "--tools", builtins, "--strict-mcp-config", "--mcp-config", mcpFile, "--setting-sources", "", "--restricted", "--disable-slash-commands", "--no-chrome", "--permission-mode", "dontAsk", "--permission-prompts", "none", "--settings", settings, "--model", model.CLIModel, "--system-prompt-file", promptFile, "--system-prompt-snapshot", "on"}
 	if resume == nil {
@@ -204,6 +209,9 @@ func (r Runner) start(ctx, requestContext context.Context, request messages.Requ
 	n.cmd.Stderr = &n.diagnostics
 	n.cmd.Dir = workspace
 	n.cmd.Env = append(n.cmd.Env, fmt.Sprintf("CLAUDE_CODE_MAX_OUTPUT_TOKENS=%d", request.MaxTokens), fmt.Sprintf("MCP_TOOL_TIMEOUT=%d", wait.Milliseconds()), fmt.Sprintf("CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT=%d", wait.Milliseconds()))
+	if request.Thinking != nil && request.Thinking.Display == "updates" {
+		n.cmd.Env = append(n.cmd.Env, "CLAUDE_CODE_THINKING_DISPLAY_UPDATES=1")
+	}
 	if request.CacheTTL == "5m" {
 		n.cmd.Env = append(n.cmd.Env, "FORCE_PROMPT_CACHING_5M=1", "CLAUDE_CODE_MESSAGES_PROMPT_CACHE_TTL=5m")
 	} else if request.CacheTTL == "1h" {
