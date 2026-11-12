@@ -12,14 +12,10 @@ import (
 func (r Request) NormalizeCache() (Request, error) {
 	// Validate before consuming the CLI's preserve-all policy. It matches the
 	// native default, so its presence must not change a session's identity.
-	if r.ContextManagement != nil {
-		for _, edit := range r.ContextManagement.Edits {
-			if edit.Type != "clear_thinking_20251015" || edit.Keep != "all" {
-				return Request{}, unsupported("context_management.edits: requires preserve-all thinking")
-			}
-		}
-		r.ContextManagement = nil
+	if err := validateContext(r.ContextManagement); err != nil {
+		return Request{}, err
 	}
+	r.ContextManagement = nil
 	consume := func(cache *CacheControl) error {
 		if cache == nil {
 			return nil

@@ -14,39 +14,6 @@ import (
 	"unbundle-go/src/internal/session"
 )
 
-type modelUsage struct {
-	Input  *int64 `json:"inputTokens"`
-	Output *int64 `json:"outputTokens"`
-	Read   *int64 `json:"cacheReadInputTokens"`
-	Write  *int64 `json:"cacheCreationInputTokens"`
-}
-
-func modelUsageDifference(before, after map[string]modelUsage) (messages.Usage, error) {
-	if len(before) == 0 || len(after) == 0 {
-		return messages.Usage{}, Failure("COMPACTION_USAGE_UNKNOWN", "compaction", "native compaction usage could not be verified; do not repeat the operation", 502)
-	}
-	total := zeroUsage()
-	for name := range before {
-		if _, ok := after[name]; !ok {
-			return messages.Usage{}, protocol()
-		}
-	}
-	for name, next := range after {
-		previous, exists := before[name]
-		a := messages.Usage{InputTokens: next.Input, OutputTokens: next.Output, CacheReadInputTokens: next.Read, CacheCreationInputTokens: next.Write}
-		b := zeroUsage()
-		if exists {
-			b = messages.Usage{InputTokens: previous.Input, OutputTokens: previous.Output, CacheReadInputTokens: previous.Read, CacheCreationInputTokens: previous.Write}
-		}
-		delta, err := usageDifference(a, b)
-		if err != nil {
-			return messages.Usage{}, err
-		}
-		total = addUsage(total, delta)
-	}
-	return total, nil
-}
-
 // Capability checks do not submit model input or release any tool waiter.
 func (n *native) prepareCompact(ctx context.Context, waiting bool) (map[string]modelUsage, error) {
 	if n.timer != nil {
@@ -215,32 +182,46 @@ func (n *native) bufferCompact(ctx context.Context, message messages.Message) er
 	}
 }
 
-func (n *native) compact(ctx context.Context, request messages.Request, receipts []messages.Message, before map[string]modelUsage) (string, messages.Usage, error) {
-	if len(receipts) > 0 {
+func compactInput(batch *toolBatch) ([]messages.Message, error) {
+	var buffered []messages.Message
+	for _, receipt := range batch.receipts {
+		isError := receipt.IsError != nil && *receipt.IsError
+		head, err := json.Marshal(map[string]any{"type": "text", "text": "The local client completed tool call " + receipt.ToolUseID + ". Native waiting was interrupted only to compact. Preserve the following actual tool-output data and do not repeat the operation. is_error=" + map[bool]string{true: "true", false: "false"}[isError]})
+		if err != nil {
+			return nil, protocol()
+		}
+		content := []jsontext.Value{head}
+		if len(receipt.Content) > 0 {
+			results, err := messages.Blocks(receipt.Content)
+			if err != nil {
+				return nil, err
+			}
+			content = append(content, results...)
+		}
+		encoded, err := json.Marshal(content)
+		if err != nil {
+			return nil, protocol()
+		}
+		buffered = append(buffered, messages.Message{Role: "user", Content: encoded})
+	}
+	if len(batch.userContext) > 0 {
+		encoded, err := json.Marshal(batch.userContext)
+		if err != nil {
+			return nil, protocol()
+		}
+		buffered = append(buffered, messages.Message{Role: "user", Content: encoded})
+	}
+	return buffered, nil
+}
+
+func (n *native) compact(ctx context.Context, request messages.Request, buffered []messages.Message, before map[string]modelUsage) (string, messages.Usage, error) {
+	if len(buffered) > 0 {
 		if err := n.interruptForCompact(ctx); err != nil {
 			return "", messages.Usage{}, err
 		}
-		for _, message := range receipts {
-			blocks, _ := messages.Blocks(message.Content)
-			for _, raw := range blocks {
-				var receipt messages.ToolResultBlock
-				if json.Unmarshal(raw, &receipt) != nil || receipt.Type != "tool_result" {
-					return "", messages.Usage{}, protocol()
-				}
-				isError := receipt.IsError != nil && *receipt.IsError
-				head, _ := json.Marshal(map[string]any{"type": "text", "text": "The local client completed tool call " + receipt.ToolUseID + ". Native waiting was interrupted only to compact. Preserve the following actual tool-output data and do not repeat the operation. is_error=" + map[bool]string{true: "true", false: "false"}[isError]})
-				content := []jsontext.Value{head}
-				if len(receipt.Content) > 0 {
-					results, err := messages.Blocks(receipt.Content)
-					if err != nil {
-						return "", messages.Usage{}, err
-					}
-					content = append(content, results...)
-				}
-				encoded, _ := json.Marshal(content)
-				if err := n.bufferCompact(ctx, messages.Message{Role: "user", Content: encoded}); err != nil {
-					return "", messages.Usage{}, err
-				}
+		for _, message := range buffered {
+			if err := n.bufferCompact(ctx, message); err != nil {
+				return "", messages.Usage{}, err
 			}
 		}
 	}
@@ -296,15 +277,4 @@ func (n *native) compact(ctx context.Context, request messages.Request, receipts
 			return "", messages.Usage{}, protocol()
 		}
 	}
-}
-
-func (n *native) writeFrame(value any) error {
-	frame, err := json.Marshal(value)
-	if err != nil {
-		return protocol()
-	}
-	if _, err = n.stdin.Write(append(frame, '\n')); err != nil {
-		return Failure("CLI_INPUT_FAILED", "input", "could not submit native maintenance input", 502)
-	}
-	return nil
 }

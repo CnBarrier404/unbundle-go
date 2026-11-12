@@ -6,7 +6,6 @@ import (
 	"encoding/json/v2"
 	"errors"
 	"slices"
-	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -55,7 +54,6 @@ func (a *Adapter) runCompact(ctx context.Context, entry *conversation, match ses
 			if errors.As(err, &failure) {
 				failure.Usage = n.currentUsage
 				copy := *failure
-				copy.Usage = n.currentUsage
 				entry.failure = &copy
 			}
 		}
@@ -110,13 +108,20 @@ func (a *Adapter) runCompact(ctx context.Context, entry *conversation, match ses
 	}
 	stop := context.AfterFunc(ctx, n.cancel)
 	defer stop()
+	var buffered []messages.Message
 	if previous == session.WaitingTools {
 		if len(match.Delta) != 1 {
 			return response, validation("COMPACTION_RESULTS_REQUIRED", "compaction requires exactly the real pending tool results")
 		}
-		if err := n.receiveResults(match.Delta[0]); err != nil {
+		batch, err := toolContinuation(match.Delta[0], n.expected)
+		if err != nil {
 			return response, err
 		}
+		buffered, err = compactInput(batch)
+		if err != nil {
+			return response, err
+		}
+		n.logger.Debug("tool_results_validated", "count", len(batch.results))
 	}
 	arm = true
 	before, err := n.prepareCompact(ctx, previous == session.WaitingTools)
@@ -140,7 +145,7 @@ func (a *Adapter) runCompact(ctx context.Context, entry *conversation, match ses
 	a.mu.Unlock()
 	accepted = true
 	n.currentUsage = messages.Usage{}
-	boundary, usage, err := n.compact(ctx, request, match.Delta, before)
+	boundary, usage, err := n.compact(ctx, request, buffered, before)
 	if err != nil {
 		return response, err
 	}
@@ -150,14 +155,10 @@ func (a *Adapter) runCompact(ctx context.Context, entry *conversation, match ses
 		return response, Failure("NATIVE_COMPACT_NOT_PERSISTED", "compaction", "native compaction did not produce a verifiable persisted summary; do not repeat the operation", 502)
 	}
 	id := "msg_" + uuid.NewString()
-	payload := "Summary:\n" + body
-	for strings.Contains(payload, "\n\n\n") {
-		payload = strings.ReplaceAll(payload, "\n\n\n", "\n\n")
-	}
 	source := append(slices.Clone(entry.boundary.Request.Messages), entry.boundary.Assistant)
 	source = append(source, match.Delta...)
 	row.SystemPrompt, row.Instructions = n.prompt, slices.Clone(n.instructions)
-	completed, err := a.store.RecordCompaction(row, request, boundary, payload, id, usage, snapshot, source)
+	completed, err := a.store.RecordCompaction(row, request, boundary, body, id, usage, snapshot, source)
 	if err != nil {
 		logger.Error("compaction_checkpoint_save_failed", logging.Cause(err))
 		return response, Failure("COMPACTION_CHECKPOINT_SAVE_FAILED", "compaction", "native compaction committed but its recovery receipt could not be saved; do not repeat the operation", 503)

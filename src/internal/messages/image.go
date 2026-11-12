@@ -8,6 +8,11 @@ import (
 	"unbundle-go/src/internal/jsonutil"
 )
 
+const (
+	maxImages     = 20
+	maxImageBytes = 4 << 20
+)
+
 type ImageBlock struct {
 	Type         string        `json:"type"`
 	CacheControl *CacheControl `json:"cache_control,omitempty"`
@@ -31,11 +36,11 @@ func DecodeImage(raw []byte) ([]byte, string, error) {
 	if image.Type != "image" || image.Source.Type != "base64" || !slices.Contains([]string{"image/png", "image/jpeg", "image/gif", "image/webp"}, image.Source.MediaType) {
 		return nil, "", unsupported("image.source")
 	}
-	if len(image.Source.Data) > base64.StdEncoding.EncodedLen(4<<20) {
+	if len(image.Source.Data) > base64.StdEncoding.EncodedLen(maxImageBytes) {
 		return nil, "", invalid("image", "decoded image exceeds 4 MiB")
 	}
 	data, err := base64.StdEncoding.Strict().DecodeString(image.Source.Data)
-	if err != nil || len(data) == 0 || len(data) > 4<<20 || http.DetectContentType(data) != image.Source.MediaType {
+	if err != nil || len(data) == 0 || len(data) > maxImageBytes || http.DetectContentType(data) != image.Source.MediaType {
 		return nil, "", invalid("image", "invalid image encoding or mismatched MIME type")
 	}
 	return data, image.Source.MediaType, nil
@@ -54,7 +59,7 @@ func resultContent(content []byte) error {
 		}
 		if kind == "image" {
 			images++
-			if images > 20 {
+			if images > maxImages {
 				return invalid("tool_result.content", "too many images")
 			}
 			if _, _, err := DecodeImage(raw); err != nil {

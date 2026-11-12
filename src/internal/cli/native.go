@@ -52,7 +52,7 @@ type native struct {
 	accounted       messages.Usage
 	currentUsage    messages.Usage
 	webPending      map[string]bool
-	instructions    []instructionUpdate
+	instructions    []session.InstructionUpdate
 	id              string
 	initialMessages int
 	prompt          string
@@ -81,7 +81,7 @@ func (r Runner) start(ctx, requestContext context.Context, request messages.Requ
 			for i := n.initialMessages; i < min(len(resume.History), len(request.Messages)); i++ {
 				message := request.Messages[i]
 				if message.Role == "system" {
-					n.instructions = append(n.instructions, instructionUpdate{Index: i, Role: "system", Content: message.Content})
+					n.instructions = append(n.instructions, session.InstructionUpdate{Index: i, Role: "system", Content: message.Content})
 				}
 			}
 		}
@@ -145,7 +145,7 @@ func (r Runner) start(ctx, requestContext context.Context, request messages.Requ
 	}
 	wait := time.Duration(r.Config.Runtime.ToolWaitTimeoutSeconds) * time.Second
 	b.onFailure = cancel
-	if err = b.start(ctx, request, r.Config.MaxRequestBytes, wait); err != nil {
+	if err = b.start(ctx, r.Config.MaxRequestBytes, wait); err != nil {
 		return nil, err
 	}
 	if len(n.instructions) > 0 {
@@ -333,16 +333,6 @@ func (n *native) parser(model string, emit func(Event) error) *parser {
 	return &parser{model: model, emit: emit, tools: n.bridge.names, servers: servers, nativeID: n.id}
 }
 
-func (n *native) receiveResults(delta messages.Message) error {
-	results, err := toolContinuation(delta, n.expected)
-	if err != nil {
-		return err
-	}
-	n.results = results
-	n.logger.Debug("tool_results_validated", "count", len(results))
-	return nil
-}
-
 func (n *native) flush() error {
 	delivered := 0
 	for id, call := range n.pending {
@@ -418,7 +408,7 @@ func (n *native) handoff() (bool, error) {
 	return true, nil
 }
 
-func (n *native) advance(ctx context.Context, request messages.Request, delta messages.Message, updates []instructionUpdate, emit func(Event) error) (response messages.Response, err error) {
+func (n *native) advance(ctx context.Context, request messages.Request, delta messages.Message, results map[string]*mcp.CallToolResult, updates []session.InstructionUpdate, emit func(Event) error) (response messages.Response, err error) {
 	n.currentUsage = messages.Usage{}
 	if n.timer != nil {
 		n.timer.Stop()
@@ -434,9 +424,7 @@ func (n *native) advance(ctx context.Context, request messages.Request, delta me
 	}
 	resumingTools := len(n.expected) > 0
 	if resumingTools {
-		if err := n.receiveResults(delta); err != nil {
-			return response, err
-		}
+		n.results = results
 		if err := n.flush(); err != nil {
 			return response, err
 		}
@@ -710,48 +698,6 @@ func cancelled(ctx context.Context) *Error {
 		return Failure("INFERENCE_TIMEOUT", "inference", "inference exceeded its deadline", 504)
 	}
 	return Failure("REQUEST_CANCELLED", "inference", "request cancelled; native process must be closed before another turn", 499)
-}
-
-func usageFields(u *messages.Usage) []**int64 {
-	return []**int64{&u.InputTokens, &u.OutputTokens, &u.CacheReadInputTokens, &u.CacheCreationInputTokens}
-}
-
-func zeroUsage() (u messages.Usage) {
-	for _, field := range usageFields(&u) {
-		value := int64(0)
-		*field = &value
-	}
-	return u
-}
-
-func addUsage(a, b messages.Usage) (u messages.Usage) {
-	x, y := usageFields(&a), usageFields(&b)
-	for i, field := range usageFields(&u) {
-		if *x[i] != nil && *y[i] != nil {
-			value := **x[i] + **y[i]
-			if value >= 0 {
-				*field = &value
-			}
-		}
-	}
-	return u
-}
-
-func usageDifference(total, accounted messages.Usage) (u messages.Usage, err error) {
-	x, y := usageFields(&total), usageFields(&accounted)
-	for i, field := range usageFields(&u) {
-		if *x[i] != nil && **x[i] < 0 || *y[i] != nil && **y[i] < 0 {
-			return u, protocol()
-		}
-		if *x[i] != nil && *y[i] != nil {
-			value := **x[i] - **y[i]
-			if value < 0 {
-				return u, protocol()
-			}
-			*field = &value
-		}
-	}
-	return u, nil
 }
 
 func emitResponse(response messages.Response, emit func(Event) error) error {

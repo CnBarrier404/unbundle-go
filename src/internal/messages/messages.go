@@ -167,12 +167,8 @@ func (r Request) Validate() error {
 	if r.Thinking != nil && !slices.Contains([]string{"", "updates"}, r.Thinking.Display) {
 		return unsupported("thinking.display")
 	}
-	if r.ContextManagement != nil {
-		for _, edit := range r.ContextManagement.Edits {
-			if edit.Type != "clear_thinking_20251015" || edit.Keep != "all" {
-				return unsupported("context_management.edits: requires preserve-all thinking")
-			}
-		}
+	if err := validateContext(r.ContextManagement); err != nil {
+		return err
 	}
 	if err := validateOutput(r.OutputConfig); err != nil {
 		return err
@@ -181,7 +177,7 @@ func (r Request) Validate() error {
 		return invalid("metadata.user_id", "exceeds 512 characters")
 	}
 	if len(r.System) > 0 {
-		if err := textContent(r.System, false); err != nil {
+		if err := textContent(r.System); err != nil {
 			return err
 		}
 	}
@@ -259,7 +255,7 @@ func (r Request) Validate() error {
 					return invalid(field, "tool results must precede images")
 				}
 				images++
-				if images > 20 {
+				if images > maxImages {
 					return invalid(field+".content", "too many images")
 				}
 				if _, _, err := DecodeImage(raw); err != nil {
@@ -388,12 +384,12 @@ func textBlock(raw jsontext.Value) error {
 	return validateCache(block.CacheControl)
 }
 
-func textContent(content jsontext.Value, allowEmpty bool) error {
+func textContent(content jsontext.Value) error {
 	blocks, err := Blocks(content)
 	if err != nil {
 		return err
 	}
-	if len(blocks) == 0 && !allowEmpty {
+	if len(blocks) == 0 {
 		return invalid("content", "must not be empty")
 	}
 	for _, block := range blocks {
@@ -407,6 +403,17 @@ func textContent(content jsontext.Value, allowEmpty bool) error {
 func validateCache(cache *CacheControl) error {
 	if cache != nil && (cache.Type != "ephemeral" || !slices.Contains([]string{"", "5m", "1h"}, cache.TTL)) {
 		return unsupported("cache_control")
+	}
+	return nil
+}
+
+func validateContext(context *ContextManagement) error {
+	if context != nil {
+		for _, edit := range context.Edits {
+			if edit.Type != "clear_thinking_20251015" || edit.Keep != "all" {
+				return unsupported("context_management.edits: requires preserve-all thinking")
+			}
+		}
 	}
 	return nil
 }

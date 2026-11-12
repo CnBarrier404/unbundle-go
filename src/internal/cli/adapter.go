@@ -7,6 +7,8 @@ import (
 	"errors"
 	"time"
 
+	"github.com/modelcontextprotocol/go-sdk/mcp"
+
 	"unbundle-go/src/internal/jsonutil"
 	"unbundle-go/src/internal/logging"
 	"unbundle-go/src/internal/messages"
@@ -115,19 +117,19 @@ func (a *Adapter) Run(ctx context.Context, request messages.Request, identity se
 		a.reapLocked()
 	}()
 	var user *messages.Message
-	var updates []instructionUpdate
+	var updates []session.InstructionUpdate
 	if match.Kind == session.Continue && !jsonutil.Equal(entry.boundary.Request.System, request.System) {
 		old, _ := messages.Blocks(entry.boundary.Request.System)
 		next, _ := messages.Blocks(request.System)
 		content, _ := json.Marshal(next[len(old):])
-		updates = append(updates, instructionUpdate{Index: len(request.Messages) - len(match.Delta), Role: "system", Content: content})
+		updates = append(updates, session.InstructionUpdate{Index: len(request.Messages) - len(match.Delta), Role: "system", Content: content})
 	}
 	for i := range match.Delta {
 		if match.Delta[i].Role == "user" && user == nil {
 			user = &match.Delta[i]
 		} else if match.Delta[i].Role == "system" {
 			if match.Kind == session.Continue {
-				updates = append(updates, instructionUpdate{Index: len(request.Messages) - len(match.Delta) + i, Role: "system", Content: match.Delta[i].Content})
+				updates = append(updates, session.InstructionUpdate{Index: len(request.Messages) - len(match.Delta) + i, Role: "system", Content: match.Delta[i].Content})
 			}
 		} else {
 			return response, validation("NATIVE_INPUT_UNSUPPORTED", "only one incremental user message is supported")
@@ -170,10 +172,14 @@ func (a *Adapter) Run(ctx context.Context, request messages.Request, identity se
 	}
 	// Reject malformed tool continuations before replacing the accepted boundary
 	// or touching the original MCP waiters. Validation errors preserve the session.
+	var results map[string]*mcp.CallToolResult
 	if len(n.expected) > 0 {
-		if err := n.receiveResults(*user); err != nil {
+		batch, err := toolContinuation(*user, n.expected)
+		if err != nil {
 			return response, err
 		}
+		results = batch.results
+		n.logger.Debug("tool_results_validated", "count", len(results))
 	}
 	if ctx.Err() != nil {
 		if match.Kind == session.New {
@@ -200,7 +206,7 @@ func (a *Adapter) Run(ctx context.Context, request messages.Request, identity se
 	entry.boundary.Request, entry.boundary.Assistant = request, messages.Message{}
 	a.mu.Unlock()
 	accepted = true
-	response, err = n.advance(ctx, request, *user, updates, emit)
+	response, err = n.advance(ctx, request, *user, results, updates, emit)
 	if err != nil {
 		if ctx.Err() != nil {
 			err = cancelled(ctx)

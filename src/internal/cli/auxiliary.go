@@ -63,7 +63,7 @@ func (a *Adapter) runAuxiliary(ctx context.Context, request messages.Request, id
 		return response, err
 	}
 	defer n.close()
-	response, err = n.advance(ctx, request, match.Delta[0], nil, emit)
+	response, err = n.advance(ctx, request, match.Delta[0], nil, nil, emit)
 	if err != nil {
 		logFailure(logger, "auxiliary_turn_failed", err)
 		return response, err

@@ -9,6 +9,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -199,7 +200,7 @@ func (s *Store) Materialize(row Checkpoint, incoming messages.Request, c config.
 		view.Compaction = row.Compaction
 		digest, err := s.requestDigest(incoming)
 		view.CompactRetry = err == nil && digest == row.Compaction.Request
-		view.RebasedDelta, _ = s.CompactedDelta(row.Compaction, incoming)
+		view.RebasedDelta, _ = s.compactedDelta(row.Compaction, incoming)
 		if view.CompactRetry || view.RebasedDelta != nil {
 			view.Request = incoming
 			if row.Settings != nil {
@@ -242,7 +243,11 @@ func (s *Store) Materialize(row Checkpoint, incoming messages.Request, c config.
 	return view
 }
 
-func (s *Store) RecordCompaction(row Checkpoint, request messages.Request, boundary, summary, responseID string, usage messages.Usage, snapshot NativeSnapshot, source []messages.Message) (Checkpoint, error) {
+func (s *Store) RecordCompaction(row Checkpoint, request messages.Request, boundary, body, responseID string, usage messages.Usage, snapshot NativeSnapshot, source []messages.Message) (Checkpoint, error) {
+	summary := "Summary:\n" + body
+	for strings.Contains(summary, "\n\n\n") {
+		summary = strings.ReplaceAll(summary, "\n\n\n", "\n\n")
+	}
 	record := &Compaction{Boundary: boundary, ResponseID: responseID, Usage: usage, SummaryLength: len(summary)}
 	var err error
 	record.Request, err = s.requestDigest(request)

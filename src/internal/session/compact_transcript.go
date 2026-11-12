@@ -8,10 +8,7 @@ import (
 	"encoding/json/jsontext"
 	"encoding/json/v2"
 	"errors"
-	"os"
-	"path/filepath"
 	"strings"
-	"time"
 
 	"github.com/google/uuid"
 )
@@ -22,52 +19,21 @@ func (s *Store) CompactSnapshot(ctx context.Context, nativeID, boundary string, 
 	if uuid.Validate(nativeID) != nil || uuid.Validate(boundary) != nil {
 		return "", NativeSnapshot{}, errors.New("invalid compaction identity")
 	}
-	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
-	defer cancel()
-	for {
-		body, snapshot, err := s.compactSnapshot(nativeID, boundary, limit)
-		if err == nil {
-			return body, snapshot, nil
-		}
-		select {
-		case <-ctx.Done():
-			return "", NativeSnapshot{}, err
-		case <-time.After(25 * time.Millisecond):
-		}
+	var body string
+	var snapshot NativeSnapshot
+	err := waitForTranscript(ctx, func() error {
+		var err error
+		body, snapshot, err = s.compactSnapshot(nativeID, boundary, limit)
+		return err
+	})
+	if err != nil {
+		return "", NativeSnapshot{}, err
 	}
+	return body, snapshot, nil
 }
 
 func (s *Store) compactSnapshot(nativeID, boundary string, limit int64) (string, NativeSnapshot, error) {
-	root, err := nativeProjects()
-	if err != nil {
-		return "", NativeSnapshot{}, err
-	}
-	projects, err := os.ReadDir(root)
-	if err != nil {
-		return "", NativeSnapshot{}, err
-	}
-	var path, project string
-	for _, dir := range projects {
-		if !dir.IsDir() || dir.Type()&os.ModeSymlink != 0 {
-			continue
-		}
-		candidate := filepath.Join(root, dir.Name(), nativeID+".jsonl")
-		info, err := os.Lstat(candidate)
-		if os.IsNotExist(err) {
-			continue
-		}
-		if err != nil || !info.Mode().IsRegular() {
-			return "", NativeSnapshot{}, errors.New("invalid native transcript")
-		}
-		if path != "" {
-			return "", NativeSnapshot{}, errors.New("ambiguous native transcript")
-		}
-		path, project = candidate, dir.Name()
-	}
-	if path == "" {
-		return "", NativeSnapshot{}, errors.New("native transcript missing")
-	}
-	file, err := os.OpenFile(path, os.O_RDWR, 0)
+	file, project, err := openTranscript(nativeID)
 	if err != nil {
 		return "", NativeSnapshot{}, err
 	}
@@ -101,7 +67,7 @@ func (s *Store) compactSnapshot(nativeID, boundary string, limit int64) (string,
 			if !ok || int64(len(text)) > limit {
 				return "", NativeSnapshot{}, errors.New("invalid native summary")
 			}
-			body, err = NativeSummaryBody(text, path)
+			body, err = nativeSummaryBody(text, file.Name())
 			if err != nil {
 				return "", NativeSnapshot{}, err
 			}
@@ -119,13 +85,13 @@ func (s *Store) compactSnapshot(nativeID, boundary string, limit int64) (string,
 	return body, NativeSnapshot{Project: project, Length: total, Digest: hex.EncodeToString(h.Sum(nil))}, nil
 }
 
-func NativeSummaryBody(text, file string) (string, error) {
+func nativeSummaryBody(text, file string) (string, error) {
 	marker := SummaryHeader + "\n\n"
 	at := strings.Index(text, marker)
 	if at < 0 || at > 2048 {
 		return "", errors.New("invalid native summary wrapper")
 	}
-	body := StripSummaryTools(text[at+len(marker):])
+	body := stripSummaryTools(text[at+len(marker):])
 	tail := "\n\nIf you need specific details from before compaction (like exact code snippets, error messages, or content you generated), read the full transcript at: "
 	if end := strings.LastIndex(body, tail); end >= 0 {
 		reference := body[end+len(tail):]

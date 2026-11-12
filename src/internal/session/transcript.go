@@ -43,6 +43,58 @@ func nativeProjects() (string, error) {
 	return filepath.Join(root, "projects"), nil
 }
 
+func openTranscript(nativeID string) (*os.File, string, error) {
+	root, err := nativeProjects()
+	if err != nil {
+		return nil, "", err
+	}
+	projects, err := os.ReadDir(root)
+	if err != nil {
+		return nil, "", err
+	}
+	var path, project string
+	for _, dir := range projects {
+		if !dir.IsDir() || dir.Type()&os.ModeSymlink != 0 {
+			continue
+		}
+		candidate := filepath.Join(root, dir.Name(), nativeID+".jsonl")
+		info, err := os.Lstat(candidate)
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil || !info.Mode().IsRegular() {
+			return nil, "", errors.New("invalid native transcript")
+		}
+		if path != "" {
+			return nil, "", errors.New("ambiguous native transcript")
+		}
+		path, project = candidate, dir.Name()
+	}
+	if path == "" {
+		return nil, "", errors.New("native transcript missing")
+	}
+	file, err := os.OpenFile(path, os.O_RDWR, 0)
+	return file, project, err
+}
+
+func waitForTranscript(ctx context.Context, read func() error) error {
+	deadline := time.NewTimer(2 * time.Second)
+	defer deadline.Stop()
+	for {
+		err := read()
+		if err == nil {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return err
+		case <-deadline.C:
+			return err
+		case <-time.After(25 * time.Millisecond):
+		}
+	}
+}
+
 // Keep the newline so byte offsets and prefix fingerprints remain exact on
 // both platforms. A partially written row is not a committed native boundary.
 func transcriptLines(reader io.Reader) *bufio.Scanner {
@@ -61,21 +113,19 @@ func transcriptLines(reader io.Reader) *bufio.Scanner {
 }
 
 func (s *Store) Snapshot(ctx context.Context, nativeID, assistantID string, content []jsontext.Value) (NativeSnapshot, error) {
-	deadline := time.NewTimer(2 * time.Second)
-	defer deadline.Stop()
-	for {
-		snapshot, err := s.snapshot(nativeID, "assistant", assistantID, content)
-		if err == nil {
-			return snapshot, nil
+	var snapshot NativeSnapshot
+	err := waitForTranscript(ctx, func() error {
+		var err error
+		snapshot, err = s.snapshot(nativeID, "assistant", assistantID, content)
+		return err
+	})
+	if err != nil {
+		if ctx.Err() != nil {
+			err = ctx.Err()
 		}
-		select {
-		case <-ctx.Done():
-			return NativeSnapshot{}, ctx.Err()
-		case <-deadline.C:
-			return NativeSnapshot{}, err
-		case <-time.After(25 * time.Millisecond):
-		}
+		return NativeSnapshot{}, err
 	}
+	return snapshot, nil
 }
 
 // SnapshotInput is used only after a canceled CLI has exited. It proves the
@@ -86,39 +136,20 @@ func (s *Store) SnapshotInput(nativeID string, content []jsontext.Value) (Native
 }
 
 func (s *Store) snapshot(nativeID, role, assistantID string, content []jsontext.Value) (NativeSnapshot, error) {
-	root, err := nativeProjects()
+	file, project, err := openTranscript(nativeID)
 	if err != nil {
 		return NativeSnapshot{}, err
 	}
-	projects, err := os.ReadDir(root)
+	defer file.Close()
+	snapshot, err := s.scanBoundary(file, role, assistantID, content)
+	if err == nil {
+		err = file.Sync()
+	}
 	if err != nil {
 		return NativeSnapshot{}, err
 	}
-	for _, project := range projects {
-		if !project.IsDir() || project.Type()&os.ModeSymlink != 0 {
-			continue
-		}
-		path := filepath.Join(root, project.Name(), nativeID+".jsonl")
-		info, err := os.Lstat(path)
-		if err != nil || !info.Mode().IsRegular() {
-			continue
-		}
-		file, err := os.OpenFile(path, os.O_RDWR, 0)
-		if err != nil {
-			return NativeSnapshot{}, err
-		}
-		snapshot, err := s.scanBoundary(file, role, assistantID, content)
-		if err == nil {
-			err = file.Sync()
-		}
-		_ = file.Close()
-		if err != nil {
-			return NativeSnapshot{}, err
-		}
-		snapshot.Project = project.Name()
-		return snapshot, nil
-	}
-	return NativeSnapshot{}, errors.New("native transcript is not committed")
+	snapshot.Project = project
+	return snapshot, nil
 }
 
 func (s *Store) scanBoundary(file io.Reader, role, assistantID string, content []jsontext.Value) (NativeSnapshot, error) {

@@ -168,33 +168,12 @@ func (p *parser) closeBlock(index int) error {
 	return p.send("content_block_stop", map[string]any{"type": "content_block_stop", "index": index})
 }
 
-func mergeUsage(dst *messages.Usage, src messages.Usage) error {
-	for _, pair := range [][2]*int64{{dst.InputTokens, src.InputTokens}, {dst.OutputTokens, src.OutputTokens}, {dst.CacheReadInputTokens, src.CacheReadInputTokens}, {dst.CacheCreationInputTokens, src.CacheCreationInputTokens}} {
-		if pair[1] != nil && (*pair[1] < 0 || pair[0] != nil && *pair[1] < *pair[0]) {
-			return protocol()
-		}
-	}
-	if src.InputTokens != nil {
-		dst.InputTokens = src.InputTokens
-	}
-	if src.OutputTokens != nil {
-		dst.OutputTokens = src.OutputTokens
-	}
-	if src.CacheReadInputTokens != nil {
-		dst.CacheReadInputTokens = src.CacheReadInputTokens
-	}
-	if src.CacheCreationInputTokens != nil {
-		dst.CacheCreationInputTokens = src.CacheCreationInputTokens
-	}
-	return nil
-}
-
 func (p *parser) finish() error {
 	if !p.started || p.response.StopReason == nil {
 		return protocol()
 	}
 	reason := *p.response.StopReason
-	if reason != messages.StopEndTurn && reason != messages.StopMaxTokens && reason != messages.StopRefusal && reason != messages.StopToolUse {
+	if messages.CheckStopReason(reason) != nil {
 		return protocol()
 	}
 	text := false

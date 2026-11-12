@@ -31,6 +31,7 @@ import (
 const mcpServerName = "local"
 
 type toolDefinition struct {
+	tool   *mcp.Tool
 	schema *jsonschema.Schema
 }
 
@@ -90,7 +91,7 @@ func prepareBridge(request messages.Request, webSearch bool) (*bridge, error) {
 		// Stable safe aliases avoid MCP/CLI name restrictions without truncating
 		// or changing the caller's name, description or schema.
 		sum := sha256.Sum256([]byte(tool.Name))
-		alias := fmtAlias(sum)
+		alias := "t_" + hex.EncodeToString(sum[:])
 		if _, exists := b.definitions[alias]; exists {
 			return nil, protocol()
 		}
@@ -139,14 +140,13 @@ func prepareBridge(request messages.Request, webSearch bool) (*bridge, error) {
 			b.names["WebSearch"] = "WebSearch"
 			continue
 		}
-		b.definitions[alias] = toolDefinition{resolved}
+		b.definitions[alias] = toolDefinition{
+			tool:   &mcp.Tool{Name: alias, Description: tool.Description, InputSchema: stdjson.RawMessage(tool.InputSchema)},
+			schema: resolved,
+		}
 		b.names["mcp__"+mcpServerName+"__"+alias] = tool.Name
 	}
 	return b, nil
-}
-
-func fmtAlias(sum [32]byte) string {
-	return "t_" + hex.EncodeToString(sum[:])
 }
 
 func (b *bridge) fail(err error) {
@@ -160,17 +160,12 @@ func (b *bridge) fail(err error) {
 	}
 }
 
-func (b *bridge) start(ctx context.Context, request messages.Request, maxBytes int64, wait time.Duration) error {
+func (b *bridge) start(ctx context.Context, maxBytes int64, wait time.Duration) error {
 	b.ctx, b.cancel = context.WithCancel(ctx)
 	logger := logging.SDK(b.logger)
 	s := mcp.NewServer(&mcp.Implementation{Name: "unbundle-local-tools", Version: "1"}, &mcp.ServerOptions{Logger: logger})
-	for _, tool := range request.Tools {
-		sum := sha256.Sum256([]byte(tool.Name))
-		alias := fmtAlias(sum)
-		if _, ok := b.definitions[alias]; !ok {
-			continue
-		}
-		s.AddTool(&mcp.Tool{Name: alias, Description: tool.Description, InputSchema: stdjson.RawMessage(tool.InputSchema)}, func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	for _, definition := range b.definitions {
+		s.AddTool(definition.tool, func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 			id, _ := req.Params.Meta["claudecode/toolUseId"].(string)
 			call := &toolCall{id: id, name: req.Params.Name, input: jsontext.Value(req.Params.Arguments), result: make(chan *mcp.CallToolResult, 1), ctx: ctx, abandon: make(chan struct{})}
 			if id == "" || len(id) > 256 || !call.input.IsValid() || call.input.Kind() != '{' {

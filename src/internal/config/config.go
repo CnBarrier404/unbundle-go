@@ -142,7 +142,7 @@ func (c Config) Validate() error {
 		return fail("logging (requires level debug/info/warn/error and format json/text)")
 	}
 	if c.CLI == nil || !plain(c.CLI.Path) || c.CLI.Version != CLIBaseline {
-		return fail("cli (requires the baseline version 2.1.316)")
+		return fail("cli (requires the baseline version " + CLIBaseline + ")")
 	}
 	if c.MaxRequestBytes < 1024 || c.MaxRequestBytes > 256<<20 {
 		return fail("max_request_bytes")

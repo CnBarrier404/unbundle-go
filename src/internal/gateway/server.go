@@ -138,13 +138,13 @@ func (s *Server) authorized(h http.Header) bool {
 	return valid == 1
 }
 
-func (s *Server) writeJSON(w http.ResponseWriter, status int, value any) error {
+func (s *Server) writeJSON(w *loggedResponse, status int, value any) error {
 	_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(time.Duration(s.config.Runtime.WriteTimeoutSeconds) * time.Second))
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	err := json.MarshalWrite(w, value)
 	if err != nil {
-		w.(*loggedResponse).writeErr = err
+		w.writeErr = err
 	}
 	return err
 }
@@ -170,9 +170,9 @@ func apiError(err error) *cli.Error {
 	return &cli.Error{Code: code, Type: "invalid_request_error", Message: "invalid, unsupported or oversized request", Stage: "validation", Outcome: "not_started", Status: status}
 }
 
-func (s *Server) fail(w http.ResponseWriter, err error, requestID string) {
+func (s *Server) fail(w *loggedResponse, err error, requestID string) {
 	e := apiError(err)
-	w.(*loggedResponse).failure = e
+	w.failure = e
 	_ = s.writeJSON(w, e.Status, map[string]any{"type": "error", "error": e, "request_id": requestID})
 }
 
@@ -182,14 +182,13 @@ func reject(code, message string, status int) *cli.Error {
 	return e
 }
 
-func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+func (s *Server) ServeHTTP(writer http.ResponseWriter, r *http.Request) {
 	id := "req_" + rand.Text()
 	method, route := requestRoute(r)
 	logger := s.logger.With("request_id", id, "method", method, "route", route)
 	r = r.WithContext(logging.With(r.Context(), logger))
-	response := &loggedResponse{ResponseWriter: w, status: http.StatusOK, result: "completed"}
-	w = response
-	defer response.finish(logger, r, time.Now())
+	w := &loggedResponse{ResponseWriter: writer, status: http.StatusOK, result: "completed"}
+	defer w.finish(logger, r, time.Now())
 	logger.Debug("request_started")
 	w.Header().Set("request-id", id)
 	w.Header().Set("Cache-Control", "no-store")
@@ -267,9 +266,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.infer(w, r, request, identity, id)
 }
 
-func (s *Server) infer(w http.ResponseWriter, r *http.Request, request messages.Request, identity session.Identity, id string) {
-	observed := w.(*loggedResponse)
-	observed.model, observed.stream = request.Model, request.Stream
+func (s *Server) infer(w *loggedResponse, r *http.Request, request messages.Request, identity session.Identity, id string) {
+	w.model, w.stream = request.Model, request.Stream
 	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(s.config.Runtime.RequestTimeoutSeconds)*time.Second)
 	defer cancel()
 	if !request.Stream {
@@ -287,10 +285,7 @@ func (s *Server) infer(w http.ResponseWriter, r *http.Request, request messages.
 				w.Header().Set("X-Unbundle-Web-Search-Hits", strconv.FormatInt(*evidence.Hits, 10))
 			}
 		}
-		recoveryHeaders(w, response.Recovery)
-		if response.Reused {
-			w.Header().Set("X-Unbundle-Response-Reused", "true")
-		}
+		responseHeaders(w, response)
 		_ = s.writeJSON(w, 200, response)
 		return
 	}
@@ -349,18 +344,18 @@ func (s *Server) infer(w http.ResponseWriter, r *http.Request, request messages.
 			return
 		case <-heartbeat.C:
 			if err := send("ping", map[string]string{"type": "ping"}); err != nil {
-				observed.writeErr = err
+				w.writeErr = err
 				return
 			}
 		case event := <-events:
 			if err := send(event.Type, event.Data); err != nil {
-				observed.writeErr = err
+				w.writeErr = err
 				return
 			}
 		case result := <-done:
 			finished = true
 			if result.err != nil {
-				observed.failure = apiError(result.err)
+				w.failure = apiError(result.err)
 				if !started {
 					s.fail(w, result.err, id)
 				} else {
@@ -368,27 +363,27 @@ func (s *Server) infer(w http.ResponseWriter, r *http.Request, request messages.
 				}
 				return
 			}
-			recoveryHeaders(w, result.response.Recovery)
-			if result.response.Reused {
-				w.Header().Set("X-Unbundle-Response-Reused", "true")
-			}
+			responseHeaders(w, result.response)
 			if err := send("message_delta", map[string]any{"type": "message_delta", "delta": map[string]any{"stop_reason": result.response.StopReason, "stop_sequence": nil}, "usage": result.response.Usage}); err != nil {
-				observed.writeErr = err
+				w.writeErr = err
 				return
 			}
 			if err := send("message_stop", map[string]string{"type": "message_stop"}); err != nil {
-				observed.writeErr = err
+				w.writeErr = err
 			}
 			return
 		}
 	}
 }
 
-func recoveryHeaders(w http.ResponseWriter, recovery *messages.Recovery) {
-	if recovery != nil {
+func responseHeaders(w http.ResponseWriter, response messages.Response) {
+	if recovery := response.Recovery; recovery != nil {
 		w.Header().Set("X-Unbundle-Recovery", recovery.State)
 		if recovery.Code != "" {
 			w.Header().Set("X-Unbundle-Recovery-Error", recovery.Code)
 		}
+	}
+	if response.Reused {
+		w.Header().Set("X-Unbundle-Response-Reused", "true")
 	}
 }

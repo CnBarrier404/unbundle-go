@@ -12,13 +12,7 @@ import (
 
 const SummarySystem = "You are a helpful AI assistant tasked with summarizing conversations."
 const SummaryHeader = "This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation."
-
-// InstructionUpdate is private recovery data, never ordinary diagnostic output.
-type InstructionUpdate struct {
-	Index   int            `json:"messageIndex"`
-	Role    string         `json:"role"`
-	Content jsontext.Value `json:"content"`
-}
+const continuationPrefix = "Caller continuation after compaction:\n"
 
 // Compaction stores keyed receipts. The authoritative summary stays in the
 // official CLI transcript; retries read it back rather than run a second model.
@@ -124,7 +118,7 @@ func (s *Store) requestDigest(r messages.Request) (string, error) {
 	return s.digest(r)
 }
 
-func (s *Store) CompactedDelta(record *Compaction, incoming messages.Request) ([]messages.Message, bool) {
+func (s *Store) compactedDelta(record *Compaction, incoming messages.Request) ([]messages.Message, bool) {
 	if record == nil || len(incoming.Messages) == 0 {
 		return nil, false
 	}
@@ -147,7 +141,7 @@ func (s *Store) CompactedDelta(record *Compaction, incoming messages.Request) ([
 	if !ok || !strings.HasPrefix(text, SummaryHeader+"\n\n") {
 		return nil, false
 	}
-	text = StripSummaryTools(strings.TrimPrefix(text, SummaryHeader+"\n\n"))
+	text = stripSummaryTools(strings.TrimPrefix(text, SummaryHeader+"\n\n"))
 	if record.SummaryLength < 1 || len(text) < record.SummaryLength {
 		return nil, false
 	}
@@ -180,7 +174,7 @@ func (s *Store) CompactedDelta(record *Compaction, incoming messages.Request) ([
 		if strings.TrimSpace(suffix) == "" {
 			return nil, false
 		}
-		content, _ := json.Marshal("Caller continuation after compaction:\n" + suffix)
+		content, _ := json.Marshal(continuationPrefix + suffix)
 		delta = []messages.Message{{Role: "user", Content: content}}
 	} else if suffix != "" {
 		// Keep caller continuation text as user data, before the fresh message.
@@ -192,7 +186,7 @@ func (s *Store) CompactedDelta(record *Compaction, incoming messages.Request) ([
 			if err != nil {
 				return nil, false
 			}
-			head, _ := json.Marshal(map[string]string{"type": "text", "text": "Caller continuation after compaction:\n" + suffix})
+			head, _ := json.Marshal(map[string]string{"type": "text", "text": continuationPrefix + suffix})
 			delta[i].Content, _ = json.Marshal(append([]jsontext.Value{head}, blocks...))
 			break
 		}
@@ -201,7 +195,7 @@ func (s *Store) CompactedDelta(record *Compaction, incoming messages.Request) ([
 }
 
 // Strip only the two documented tool-list wrappers, never arbitrary XML.
-func StripSummaryTools(text string) string {
+func stripSummaryTools(text string) string {
 	if strings.HasPrefix(text, "Tools called before this summary: ") {
 		if end := strings.IndexByte(text, '\n'); end >= 0 {
 			return text[end+1:]

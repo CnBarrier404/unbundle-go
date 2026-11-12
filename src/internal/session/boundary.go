@@ -179,8 +179,8 @@ func Resolve(incoming messages.Request, identity Identity, candidates []Candidat
 			if candidate.State == Active {
 				return Match{}, fail("SESSION_BUSY")
 			}
-			if candidate.ConfigMismatch || !compatible(candidate.Request, incoming) {
-				rejection = ConfigurationChange(candidate.Request, incoming)
+			if change := ConfigurationChange(candidate.Request, incoming); candidate.ConfigMismatch || change != "" {
+				rejection = change
 				if rejection == "" {
 					rejection = "SESSION_CONFIG_CHANGED"
 				}
@@ -232,12 +232,14 @@ func Resolve(incoming messages.Request, identity Identity, candidates []Candidat
 		}
 		// A closed boundary still identifies retries and continuations, even if
 		// a retry changes its budget. It never authorizes another CLI startup.
-		if candidate.State != Closed && (candidate.ConfigMismatch || !compatible(candidate.Request, incoming)) {
-			rejection = ConfigurationChange(candidate.Request, incoming)
-			if rejection == "" {
-				rejection = "SESSION_CONFIG_CHANGED"
+		if candidate.State != Closed {
+			if change := ConfigurationChange(candidate.Request, incoming); candidate.ConfigMismatch || change != "" {
+				rejection = change
+				if rejection == "" {
+					rejection = "SESSION_CONFIG_CHANGED"
+				}
+				continue
 			}
-			continue
 		}
 		if sameRequest {
 			matches = append(matches, Match{Kind: Retry, CandidateID: candidate.ID})
@@ -303,8 +305,4 @@ func newInput(delta []messages.Message) bool {
 		}
 	}
 	return users == 1
-}
-
-func compatible(a, b messages.Request) bool {
-	return ConfigurationChange(a, b) == ""
 }
