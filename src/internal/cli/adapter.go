@@ -56,6 +56,7 @@ func (a *Adapter) Run(ctx context.Context, request messages.Request, identity se
 	accepted := false
 	var content jsontext.Value
 	var activeRecord session.Checkpoint
+	var user *messages.Message
 	defer func() {
 		if n != nil && (accepted && err != nil || !accepted && started || a.ctx.Err() != nil) {
 			n.close() // never wait for process or MCP cleanup under the pool lock
@@ -74,7 +75,7 @@ func (a *Adapter) Run(ctx context.Context, request messages.Request, identity se
 			}
 		}
 		if accepted && err != nil && errors.Is(ctx.Err(), context.Canceled) && a.ctx.Err() == nil {
-			interrupted = a.saveInterrupted(n, activeRecord, request)
+			interrupted = a.saveInterrupted(n, activeRecord, request, user)
 		}
 		a.mu.Lock()
 		defer a.mu.Unlock()
@@ -96,6 +97,9 @@ func (a *Adapter) Run(ctx context.Context, request messages.Request, identity se
 			if interrupted != nil {
 				entry.checkpoint = interrupted
 				entry.boundary.Assistant = session.InterruptionReceipt()
+				if interrupted.PendingInput {
+					entry.boundary.Assistant = messages.Message{}
+				}
 				entry.boundary.State = session.Idle
 				entry.failure = nil
 				return
@@ -116,7 +120,6 @@ func (a *Adapter) Run(ctx context.Context, request messages.Request, identity se
 		entry.lastUsed = time.Now()
 		a.reapLocked()
 	}()
-	var user *messages.Message
 	var updates []session.InstructionUpdate
 	if match.Kind == session.Continue && !jsonutil.Equal(entry.boundary.Request.System, request.System) {
 		old, _ := messages.Blocks(entry.boundary.Request.System)

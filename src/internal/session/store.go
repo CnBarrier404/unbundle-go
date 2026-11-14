@@ -34,6 +34,7 @@ type Checkpoint struct {
 	Assistant       string              `json:"assistant,omitempty"`
 	Ready           bool                `json:"ready"`
 	Interrupted     bool                `json:"interrupted,omitempty"`
+	PendingInput    bool                `json:"pending_input,omitempty"`
 	PendingTools    bool                `json:"pending_tools,omitempty"`
 	Snapshot        NativeSnapshot      `json:"snapshot"`
 	SystemPrompt    string              `json:"system_prompt,omitempty"`
@@ -105,6 +106,9 @@ func (s *Store) Load() ([]Checkpoint, error) {
 			}
 			if row.PendingTools && (!row.Ready || row.Interrupted || row.Compaction != nil) {
 				return errors.New("invalid pending tool checkpoint")
+			}
+			if row.PendingInput && (!row.Ready || !row.Interrupted || row.PendingTools || row.Compaction != nil) {
+				return errors.New("invalid interrupted input checkpoint")
 			}
 			if record := row.Compaction; record != nil {
 				if !row.Ready || uuid.Validate(record.Boundary) != nil || record.SummaryLength < 1 || record.SummaryLength > 256<<20 || record.Leading < 0 || record.Leading > len(record.Source) || len(record.Summary) != 64 || len(record.Request) != 64 || record.ResponseID == "" {
@@ -196,6 +200,9 @@ func (s *Store) Active(id string, identity Identity, nativeID string, initialMes
 // matching view. The returned messages are never replayed into the native CLI.
 func (s *Store) Materialize(row Checkpoint, incoming messages.Request, c config.Config) Candidate {
 	view := Candidate{ID: row.ID, Identity: row.Identity, State: Closed}
+	if row.PendingInput {
+		return s.materializeInterrupted(row, incoming, c)
+	}
 	if row.Compaction != nil {
 		view.Compaction = row.Compaction
 		digest, err := s.requestDigest(incoming)

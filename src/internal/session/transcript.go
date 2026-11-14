@@ -129,7 +129,7 @@ func (s *Store) Snapshot(ctx context.Context, nativeID, assistantID string, cont
 }
 
 // SnapshotInput is used only after a canceled CLI has exited. It proves the
-// final native conversation row contains the real submitted tool results and
+// final native conversation row contains the real submitted input and
 // that no later assistant output would be lost by resuming that boundary.
 func (s *Store) SnapshotInput(nativeID string, content []jsontext.Value) (NativeSnapshot, error) {
 	return s.snapshot(nativeID, "user", "", content)

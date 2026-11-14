@@ -8,11 +8,30 @@ import (
 	"unbundle-go/src/internal/session"
 )
 
-// Called after process exit. Recovery is limited to actual text tool results
-// committed before cancellation, with no subsequent native assistant output.
-func (a *Adapter) saveInterrupted(n *native, row session.Checkpoint, request messages.Request) *session.Checkpoint {
-	if n == nil || len(n.expected) == 0 || len(request.Messages) == 0 {
+// Called after process exit. Only committed input with no subsequent native
+// assistant output can be recovered; caller history is never replayed.
+func (a *Adapter) saveInterrupted(n *native, row session.Checkpoint, request messages.Request, input *messages.Message) *session.Checkpoint {
+	if n == nil || input == nil || len(request.Messages) == 0 {
 		return nil
+	}
+	if len(n.expected) == 0 {
+		blocks, err := session.TextInput(input.Content)
+		if err != nil {
+			return nil
+		}
+		snapshot, err := a.store.SnapshotInput(n.id, blocks)
+		if err != nil {
+			n.logger.Warn("interrupted_checkpoint_unavailable")
+			return nil
+		}
+		row.SystemPrompt, row.Instructions = n.prompt, n.instructions
+		row.Ready, row.Interrupted, row.PendingInput, row.Snapshot = true, true, true, snapshot
+		if err := a.store.Put(row); err != nil {
+			n.logger.Error("interrupted_checkpoint_save_failed")
+			return nil
+		}
+		n.logger.Info("interrupted_input_checkpoint_ready")
+		return &row
 	}
 	blocks, err := messages.Blocks(request.Messages[len(request.Messages)-1].Content)
 	if err != nil || len(blocks) != len(n.expected) {

@@ -70,6 +70,12 @@ func NewAdapter(ctx context.Context, c config.Config) (*Adapter, error) {
 	ctx, cancel := context.WithCancel(ctx)
 	a := &Adapter{Config: c, ctx: ctx, cancel: cancel, entries: make(map[string]*conversation), store: store}
 	for _, row := range rows {
+		if !row.Ready {
+			if recovered, err := store.RecoverInterruptedInput(row); err == nil {
+				row = recovered
+				logging.From(ctx).Info("interrupted_input_checkpoint_recovered", "session_id", row.ID)
+			}
+		}
 		state := session.Closed
 		if row.Ready {
 			state = session.Idle
@@ -155,7 +161,7 @@ func (a *Adapter) acquire(ctx context.Context, request messages.Request, identit
 		if source, compact := session.CompactionIntent(request, identity); compact {
 			lookup = source
 		}
-		if len(candidate.Request.Messages) == 0 && entry.checkpoint != nil {
+		if entry.checkpoint != nil && (len(candidate.Request.Messages) == 0 || entry.checkpoint.PendingInput) {
 			candidate = a.store.Materialize(*entry.checkpoint, lookup, a.Config)
 		}
 		if entry.checkpoint != nil && entry.checkpoint.Compaction != nil {
@@ -230,7 +236,7 @@ func (a *Adapter) acquire(ctx context.Context, request messages.Request, identit
 		id := rand.Text()
 		entry = &conversation{boundary: session.Candidate{ID: id, Identity: identity, State: session.Idle, Request: request}, lastUsed: time.Now()}
 		a.entries[id] = entry
-	} else if len(entry.boundary.Request.Messages) == 0 {
+	} else if len(entry.boundary.Request.Messages) == 0 || entry.checkpoint != nil && entry.checkpoint.PendingInput {
 		lookup := request
 		if source, compact := session.CompactionIntent(request, identity); compact && match.Kind != session.CompactRetry {
 			lookup = source
