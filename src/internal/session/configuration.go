@@ -9,16 +9,14 @@ import (
 )
 
 // ConfigurationChange names the actual incompatible setting. Append-only
-// instructions and tool order changes have an explicit safe interpretation.
+// instructions, per-turn thinking and tool order changes have an explicit
+// native interpretation.
 func ConfigurationChange(a, b messages.Request) string {
 	if a.Model != b.Model {
 		return "SESSION_MODEL_CHANGE_UNSUPPORTED"
 	}
 	if a.MaxTokens != b.MaxTokens {
 		return "SESSION_OUTPUT_BUDGET_CHANGE_UNSUPPORTED"
-	}
-	if !jsonutil.Equal(a.Thinking, b.Thinking) || !jsonutil.Equal(a.OutputConfig, b.OutputConfig) {
-		return "SESSION_THINKING_CHANGE_UNSUPPORTED"
 	}
 	if a.CacheTTL != b.CacheTTL {
 		return "SESSION_CACHE_POLICY_CHANGE_UNSUPPORTED"
@@ -49,6 +47,8 @@ func ConfigurationChange(a, b messages.Request) string {
 	a.Metadata, b.Metadata = nil, nil
 	a.Stream, b.Stream = false, false
 	a.System, b.System = nil, nil
+	a.Thinking, b.Thinking = nil, nil
+	a.OutputConfig, b.OutputConfig = nil, nil
 	if !jsonutil.Equal(a, b) {
 		return "SESSION_CONFIG_CHANGED"
 	}

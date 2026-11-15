@@ -6,7 +6,39 @@ import (
 	"encoding/json/jsontext"
 	"encoding/json/v2"
 	"time"
+
+	"unbundle-go/src/internal/jsonutil"
+	"unbundle-go/src/internal/messages"
 )
+
+// Apply and acknowledge per-turn settings before any user input or tool result.
+// Explicit nulls clear previous overrides when the caller returns to defaults.
+// The CLI owns when effort changes take effect within an ongoing tool loop.
+func (n *native) updateThinking(ctx context.Context, request messages.Request) error {
+	settings := map[string]any{"effortLevel": nil, "alwaysThinkingEnabled": nil, "showThinkingSummaries": true}
+	if request.OutputConfig != nil {
+		settings["effortLevel"] = request.OutputConfig.Effort
+	}
+	if request.Thinking != nil {
+		settings["alwaysThinkingEnabled"] = true
+		if request.Thinking.Display == "updates" {
+			settings["showThinkingSummaries"] = false
+		}
+	}
+	value, err := json.Marshal(settings)
+	if err != nil {
+		return protocol()
+	}
+	if jsonutil.Equal(n.thinkingSettings, value) {
+		return nil
+	}
+	if _, err := n.control(ctx, map[string]any{"subtype": "apply_flag_settings", "settings": settings}); err != nil {
+		return err
+	}
+	n.thinkingSettings = value
+	n.logger.Debug("native_thinking_updated")
+	return nil
+}
 
 // Control messages are serialized with inference. Acknowledgement is required
 // before submitting user input or releasing any pending local tool result.
