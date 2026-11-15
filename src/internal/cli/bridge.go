@@ -64,7 +64,7 @@ type bridge struct {
 	instructionMu       sync.RWMutex
 	instructionHandlers map[string]*mcp.StreamableHTTPHandler
 	instructionRevision int
-	instructionName     string
+	instructionLaunch   string
 	interruptedIDs      sync.Map
 	logger              *slog.Logger
 }

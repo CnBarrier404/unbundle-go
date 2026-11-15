@@ -165,7 +165,7 @@ func (r Runner) start(ctx, requestContext context.Context, request messages.Requ
 		if err != nil {
 			return nil, err
 		}
-		b.instructionName = name
+		b.instructionLaunch = name
 	}
 	mcpFile := filepath.Join(n.work, "mcp.json")
 	if err := os.WriteFile(mcpFile, b.config, 0600); err != nil {
@@ -316,9 +316,11 @@ func (n *native) parser(model string, emit func(Event) error) *parser {
 	if len(n.bridge.definitions) > 0 {
 		servers[mcpServerName] = true
 	}
-	if n.bridge.instructionName != "" {
-		servers[n.bridge.instructionName] = true
+	n.bridge.instructionMu.RLock()
+	for name := range n.bridge.instructionHandlers {
+		servers[name] = true
 	}
+	n.bridge.instructionMu.RUnlock()
 	return &parser{model: model, emit: emit, tools: n.bridge.names, servers: servers, nativeID: n.id}
 }
 

@@ -55,12 +55,13 @@ func (n *native) updateInstructions(ctx context.Context, updates []session.Instr
 	}
 	n.bridge.instructionMu.Lock()
 	for previous := range n.bridge.instructionHandlers {
-		if previous != name {
+		// Runtime replacement does not remove the MCP supplied at CLI launch.
+		// Keep its handler and validation entry until this native process exits.
+		if previous != name && previous != n.bridge.instructionLaunch {
 			delete(n.bridge.instructionHandlers, previous)
 		}
 	}
 	n.bridge.instructionMu.Unlock()
-	n.bridge.instructionName = name
 	n.instructions = all
 	logging.From(ctx).Debug("caller_instructions_updated", "update_count", len(updates))
 	return nil
