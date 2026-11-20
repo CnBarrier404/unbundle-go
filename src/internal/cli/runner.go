@@ -17,15 +17,17 @@ import (
 
 // Error never contains raw CLI diagnostics, arguments, paths or credentials.
 type Error struct {
-	Code      string         `json:"code"`
-	Type      string         `json:"type"`
-	Message   string         `json:"message"`
-	Stage     string         `json:"stage"`
-	Retryable bool           `json:"retryable"`
-	Outcome   string         `json:"outcome"`
-	Usage     messages.Usage `json:"usage"`
-	Status    int            `json:"-"`
-	location  string
+	Code         string         `json:"code"`
+	Type         string         `json:"type"`
+	Message      string         `json:"message"`
+	Stage        string         `json:"stage"`
+	Retryable    bool           `json:"retryable"`
+	Outcome      string         `json:"outcome"`
+	Usage        messages.Usage `json:"usage"`
+	QuotaResetAt int64          `json:"reset_at,omitempty"` // Unix seconds.
+	QuotaWindow  string         `json:"quota_window,omitempty"`
+	Status       int            `json:"-"`
+	location     string
 }
 
 func (e *Error) Error() string { return e.Code + ": " + e.Message }

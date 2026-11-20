@@ -219,15 +219,19 @@ func (p *parser) finish() error {
 
 func (p *parser) accept(line []byte) error {
 	var frame struct {
-		Type            string           `json:"type"`
-		SessionID       string           `json:"session_id"`
-		Subtype         string           `json:"subtype"`
-		Event           jsontext.Value   `json:"event"`
-		Message         wireMessage      `json:"message"`
-		IsError         bool             `json:"is_error"`
-		APIError        bool             `json:"is_api_error_message"`
-		APIErrorStatus  int              `json:"api_error_status"`
-		APIErrorKind    string           `json:"api_error"`
+		Type           string         `json:"type"`
+		SessionID      string         `json:"session_id"`
+		Subtype        string         `json:"subtype"`
+		Event          jsontext.Value `json:"event"`
+		Message        wireMessage    `json:"message"`
+		IsError        bool           `json:"is_error"`
+		APIError       bool           `json:"is_api_error_message"`
+		APIErrorStatus int            `json:"api_error_status"`
+		APIErrorKind   string         `json:"api_error"`
+		APIErrorParams struct {
+			RateLimit quotaInfo `json:"rate_limit_info"`
+		} `json:"api_error_params"`
+		Result          string           `json:"result"`
 		Usage           messages.Usage   `json:"usage"`
 		Tools           []string         `json:"tools"`
 		MCPServers      []jsontext.Value `json:"mcp_servers"`
@@ -274,6 +278,13 @@ func (p *parser) accept(line []byte) error {
 		return nil
 	case "assistant":
 		if frame.APIError {
+			var text string
+			if len(frame.Message.Content) == 1 && frame.Message.Content[0].Type == "text" {
+				text = frame.Message.Content[0].Text
+			}
+			if err := quotaFailure(frame.APIErrorKind, frame.APIErrorStatus, frame.APIErrorParams.RateLimit, text); err != nil {
+				return err
+			}
 			return upstreamFailure(frame.APIErrorStatus, frame.APIErrorKind)
 		}
 		if frame.Message.StopReason == nil {
@@ -291,6 +302,9 @@ func (p *parser) accept(line []byte) error {
 			return err
 		}
 		if frame.IsError || frame.Subtype != "success" {
+			if err := quotaFailure(frame.APIErrorKind, frame.APIErrorStatus, frame.APIErrorParams.RateLimit, frame.Result); err != nil {
+				return err
+			}
 			return upstreamFailure(0, frame.Subtype)
 		}
 		if !p.terminal {

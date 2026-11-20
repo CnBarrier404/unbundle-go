@@ -17,6 +17,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"unbundle-go/src/internal/cli"
@@ -33,6 +34,7 @@ type Server struct {
 	token  [32]byte
 	active chan struct{}
 	logger *slog.Logger
+	quotas sync.Map // request model -> cli.Error containing a confirmed reset
 }
 
 func New(ctx context.Context, c config.Config) (*Server, error) {
@@ -172,6 +174,9 @@ func apiError(err error) *cli.Error {
 
 func (s *Server) fail(w *loggedResponse, err error, requestID string) {
 	e := apiError(err)
+	if e.Code == cli.QuotaExhausted {
+		e = s.quotaError(w, e, false)
+	}
 	w.failure = e
 	_ = s.writeJSON(w, e.Status, map[string]any{"type": "error", "error": e, "request_id": requestID})
 }
@@ -268,6 +273,14 @@ func (s *Server) ServeHTTP(writer http.ResponseWriter, r *http.Request) {
 
 func (s *Server) infer(w *loggedResponse, r *http.Request, request messages.Request, identity session.Identity, id string) {
 	w.model, w.stream = request.Model, request.Stream
+	if value, ok := s.quotas.Load(request.Model); ok {
+		quota := value.(cli.Error)
+		if quota.QuotaResetAt > time.Now().Unix() {
+			s.fail(w, &quota, id)
+			return
+		}
+		s.quotas.CompareAndDelete(request.Model, quota)
+	}
 	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(s.config.Runtime.RequestTimeoutSeconds)*time.Second)
 	defer cancel()
 	if !request.Stream {
@@ -355,11 +368,14 @@ func (s *Server) infer(w *loggedResponse, r *http.Request, request messages.Requ
 		case result := <-done:
 			finished = true
 			if result.err != nil {
-				w.failure = apiError(result.err)
 				if !started {
 					s.fail(w, result.err, id)
 				} else {
-					_ = send("error", map[string]any{"type": "error", "error": apiError(result.err), "request_id": id})
+					w.failure = apiError(result.err)
+					if w.failure.Code == cli.QuotaExhausted {
+						w.failure = s.quotaError(w, w.failure, true)
+					}
+					_ = send("error", map[string]any{"type": "error", "error": w.failure, "request_id": id})
 				}
 				return
 			}
