@@ -17,7 +17,7 @@ import (
 
 const (
 	SchemaVersion                = 1
-	CLIBaseline                  = "2.1.316"
+	CLIBaseline                  = "2.1.330"
 	MaxConfigBytes         int64 = 1 << 20
 	DefaultMaxRequestBytes int64 = 8 << 20
 )
