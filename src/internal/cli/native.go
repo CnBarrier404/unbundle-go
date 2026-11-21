@@ -12,6 +12,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -173,10 +175,15 @@ func (r Runner) start(ctx, requestContext context.Context, request messages.Requ
 		n.logger.Error("mcp_config_write_failed", logging.Cause(err))
 		return nil, Failure("MCP_CONFIG_FAILED", "startup", "could not prepare private MCP configuration", 503)
 	}
-	builtins := ""
-	if b.webSchema != nil {
-		builtins = "WebSearch"
+	var builtinNames []string
+	discovery := len(b.definitions) > 0
+	if discovery {
+		builtinNames = append(builtinNames, toolSearch)
 	}
+	if b.webSchema != nil {
+		builtinNames = append(builtinNames, "WebSearch")
+	}
+	builtins := strings.Join(builtinNames, ",")
 	// Per-turn settings use the control protocol, including the first turn.
 	// Keep launch settings neutral so clearing an override restores CLI defaults.
 	settings := `{"disableAllHooks":true}`
@@ -192,11 +199,12 @@ func (r Runner) start(ctx, requestContext context.Context, request messages.Requ
 	if len(b.names) > 0 {
 		allowed := "mcp__" + mcpServerName + "__*"
 		if builtins != "" {
-			allowed += ",WebSearch"
+			allowed += "," + builtins
 		}
 		args = append(args, "--allowedTools", allowed)
 	}
 	n.cmd = command(ctx, r.Config.CLI.Path, args...)
+	n.cmd.Env = append(n.cmd.Env, "ENABLE_TOOL_SEARCH="+strconv.FormatBool(discovery))
 	n.cmd.Stderr = &n.diagnostics
 	n.cmd.Dir = workspace
 	n.cmd.Env = append(n.cmd.Env, fmt.Sprintf("CLAUDE_CODE_MAX_OUTPUT_TOKENS=%d", request.MaxTokens), fmt.Sprintf("MCP_TOOL_TIMEOUT=%d", wait.Milliseconds()), fmt.Sprintf("CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT=%d", wait.Milliseconds()))
@@ -358,7 +366,7 @@ func (n *native) handoff() (bool, error) {
 	}
 	if len(n.expected) == 0 {
 		for _, block := range n.p.blocks {
-			if block.Type != "tool_use" {
+			if block.Type != "tool_use" || block.Name == toolSearch {
 				continue
 			}
 			if n.seen[block.ID] {
@@ -442,6 +450,7 @@ func (n *native) advance(ctx context.Context, request messages.Request, delta me
 	var output int64
 	searching := false
 	searchCalls := 0
+	discoveryCalls := 0
 	var webEvidence *messages.WebSearchEvidence
 	if n.bridge.webSchema != nil {
 		requests, hits := int64(0), int64(0)
@@ -482,7 +491,7 @@ func (n *native) advance(ctx context.Context, request messages.Request, delta me
 		case <-handoffDeadline:
 			return response, Failure("MCP_HANDOFF_UNVERIFIED", "tools", "tool handoff could not be verified; no tool batch was delivered", 502)
 		case call := <-n.bridge.calls:
-			if searching {
+			if searching && len(n.webPending) > 0 {
 				return response, protocol()
 			}
 			if n.pending[call.id] != nil || n.returned[call.id] || n.seen[call.id] && !resumingTools {
@@ -549,6 +558,12 @@ func (n *native) advance(ctx context.Context, request messages.Request, delta me
 					if json.Unmarshal(raw, &receipt) != nil || receipt.Type != "tool_result" {
 						return response, protocol()
 					}
+					if handled, err := n.p.discoveryReceipt(receipt.ToolUseID); handled {
+						if err != nil {
+							return response, err
+						}
+						continue
+					}
 					if searching && n.webPending[receipt.ToolUseID] {
 						if receipt.IsError != nil && *receipt.IsError {
 							return response, Failure("WEB_SEARCH_FAILED", "web_search", "official CLI WebSearch failed; raw search diagnostics were withheld", 502)
@@ -568,6 +583,13 @@ func (n *native) advance(ctx context.Context, request messages.Request, delta me
 				continue
 			}
 			newMessage := frame.Type == "stream_event" && frame.Event.Type == "message_start" && frame.Event.Message.ID != n.p.response.ID || frame.Type == "assistant" && frame.Message.ID != n.p.response.ID
+			if newMessage {
+				for _, pending := range n.p.discoveries {
+					if pending {
+						return response, protocol()
+					}
+				}
+			}
 			if searching && newMessage {
 				if len(n.webPending) != 0 {
 					return response, protocol()
@@ -597,17 +619,29 @@ func (n *native) advance(ctx context.Context, request messages.Request, delta me
 		}
 		if !resumingTools && !searching {
 			if n.p.terminal && n.p.response.StopReason != nil && *n.p.response.StopReason == messages.StopToolUse {
+				if len(n.expected) == 0 {
+					for id := range n.p.discoveries {
+						if n.seen[id] {
+							return response, protocol()
+						}
+						n.seen[id] = true
+					}
+					discoveryCalls += len(n.p.discoveries)
+					if discoveryCalls > 8 {
+						return response, Failure("TOOL_SEARCH_CALL_LIMIT", "tools", "native ToolSearch call limit exceeded", 502)
+					}
+				}
 				web, local := 0, 0
 				for _, block := range n.p.blocks {
 					if block.Type == "tool_use" {
 						if block.Name == "WebSearch" {
 							web++
-						} else {
+						} else if block.Name != toolSearch {
 							local++
 						}
 					}
 				}
-				if web > 0 {
+				if web > 0 || local == 0 {
 					if local > 0 {
 						return response, Failure("MIXED_WEB_SEARCH_BATCH_UNSUPPORTED", "web_search", "WebSearch and local tools must use separate native batches; no local tools were delivered", 502)
 					}
@@ -617,7 +651,7 @@ func (n *native) advance(ctx context.Context, request messages.Request, delta me
 					}
 					n.webPending = make(map[string]bool)
 					for _, block := range n.p.blocks {
-						if block.Type != "tool_use" {
+						if block.Type != "tool_use" || block.Name == toolSearch {
 							continue
 						}
 						if n.seen[block.ID] {

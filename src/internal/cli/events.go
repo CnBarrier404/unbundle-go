@@ -62,6 +62,21 @@ type parser struct {
 	tools    map[string]string // native name -> caller name
 	streamed map[string]bool
 	servers  map[string]bool
+	// Native discovery receipts belong to this assistant message, including
+	// receipts arriving after a mixed batch has been handed to the caller.
+	discoveries map[string]bool // tool use ID -> receipt outstanding
+}
+
+func (p *parser) discoveryReceipt(id string) (bool, error) {
+	pending, found := p.discoveries[id]
+	if !found {
+		return false, nil
+	}
+	if !pending {
+		return true, protocol()
+	}
+	p.discoveries[id] = false
+	return true, nil
 }
 
 func protocol() *Error {
@@ -108,6 +123,15 @@ func (p *parser) begin(index int, b block) error {
 	if b.Type == "tool_use" {
 		if b.ID == "" || p.tools[b.Name] == "" || b.Input.Kind() != '{' {
 			return protocol()
+		}
+		if b.Name == toolSearch {
+			if p.discoveries == nil {
+				p.discoveries = make(map[string]bool)
+			}
+			if _, exists := p.discoveries[b.ID]; exists {
+				return protocol()
+			}
+			p.discoveries[b.ID] = true
 		}
 		return nil
 	}
@@ -197,6 +221,9 @@ func (p *parser) finish() error {
 				return protocol()
 			}
 			ids[b.ID] = true
+			if b.Name == toolSearch {
+				continue
+			}
 			raw, err = json.Marshal(messages.ToolUseBlock{Type: "tool_use", ID: b.ID, Name: p.tools[b.Name], Input: b.Input})
 		} else {
 			raw, err = json.Marshal(b)

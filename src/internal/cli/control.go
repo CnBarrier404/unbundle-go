@@ -96,6 +96,23 @@ func (n *native) requestControl(ctx context.Context, request any, observers ...f
 			return frame.Response.Response, nil
 		case "rate_limit_event":
 			n.logQuotaEvent(ctx, line)
+		case "user":
+			// A discovery receipt from a mixed batch can arrive while the
+			// next Desktop request is applying its per-turn settings.
+			var receipt struct {
+				Message struct {
+					Content []messages.ToolResultBlock `json:"content"`
+				} `json:"message"`
+			}
+			if json.Unmarshal(line, &receipt) != nil || len(receipt.Message.Content) == 0 {
+				return nil, protocol()
+			}
+			for _, block := range receipt.Message.Content {
+				handled, err := n.p.discoveryReceipt(block.ToolUseID)
+				if block.Type != "tool_result" || !handled || err != nil {
+					return nil, protocol()
+				}
+			}
 		case "system", "tool_progress", "command_lifecycle":
 			if err := n.p.accept(line); err != nil {
 				return nil, err

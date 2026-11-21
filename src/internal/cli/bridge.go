@@ -14,6 +14,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"regexp"
 	"slices"
 	"strings"
 	"sync"
@@ -29,6 +30,18 @@ import (
 )
 
 const mcpServerName = "local"
+const toolSearch = "ToolSearch"
+
+// Leave room for the qualified MCP prefix within the upstream name limit.
+var readableToolName = regexp.MustCompile(`^[a-zA-Z0-9_-]{1,52}$`)
+
+func toolAlias(name string) string {
+	if readableToolName.MatchString(name) && !strings.HasPrefix(name, "t_") {
+		return name
+	}
+	sum := sha256.Sum256([]byte(name))
+	return "t_" + hex.EncodeToString(sum[:24])
+}
 
 type toolDefinition struct {
 	tool   *mcp.Tool
@@ -88,10 +101,7 @@ func prepareBridge(request messages.Request, webSearch bool) (*bridge, error) {
 		}
 	}
 	for _, tool := range request.Tools {
-		// Stable safe aliases avoid MCP/CLI name restrictions without truncating
-		// or changing the caller's name, description or schema.
-		sum := sha256.Sum256([]byte(tool.Name))
-		alias := "t_" + hex.EncodeToString(sum[:])
+		alias := toolAlias(tool.Name)
 		if _, exists := b.definitions[alias]; exists {
 			return nil, protocol()
 		}
@@ -140,11 +150,19 @@ func prepareBridge(request messages.Request, webSearch bool) (*bridge, error) {
 			b.names["WebSearch"] = "WebSearch"
 			continue
 		}
+		description := tool.Description
+		if alias != tool.Name {
+			// Keep the original name searchable even when MCP needs an alias.
+			description = tool.Name + "\n" + description
+		}
 		b.definitions[alias] = toolDefinition{
-			tool:   &mcp.Tool{Name: alias, Description: tool.Description, InputSchema: stdjson.RawMessage(tool.InputSchema)},
+			tool:   &mcp.Tool{Name: alias, Description: description, InputSchema: stdjson.RawMessage(tool.InputSchema)},
 			schema: resolved,
 		}
 		b.names["mcp__"+mcpServerName+"__"+alias] = tool.Name
+	}
+	if len(b.definitions) > 0 {
+		b.names[toolSearch] = toolSearch
 	}
 	return b, nil
 }
