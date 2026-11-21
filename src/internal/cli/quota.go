@@ -25,8 +25,8 @@ type quotaObservation struct {
 	Utilization *float64 `json:"utilization"`
 }
 
-// Rate-limit notifications are advisory. Log only recognized fields, and keep
-// unfamiliar or malformed notifications out of request handling.
+// A notification alone is advisory. Only a subsequent native API error can
+// confirm rejection of an inference request.
 func (n *native) logQuotaEvent(ctx context.Context, line []byte) {
 	var event struct {
 		SessionID string `json:"session_id"`
@@ -41,6 +41,7 @@ func (n *native) logQuotaEvent(ctx context.Context, line []byte) {
 	if json.Unmarshal(line, &event) != nil || event.SessionID != n.id {
 		return
 	}
+	n.lastQuota = event.Info.quotaInfo
 	logger := logging.From(ctx)
 	logWindow := func(window string, observation quotaObservation) {
 		attrs := []any{"quota_window", window}
@@ -78,6 +79,39 @@ func (n *native) logQuotaEvent(ctx context.Context, line []byte) {
 		return
 	}
 	logWindow(event.Info.Window, event.Info.quotaObservation)
+}
+
+// Side questions wrap upstream failures in synthetic text. The OAuth CLI also
+// emits the rejected quota window separately from this reply.
+func auxiliaryFailure(text *string, info quotaInfo) *Error {
+	if text != nil {
+		body, apiError := strings.CutPrefix(*text, "(API error: ")
+		if apiError {
+			body = strings.TrimSuffix(body, ")")
+			switch info.Window {
+			case "5h":
+				info.Window = "five_hour"
+			case "7d":
+				info.Window = "seven_day"
+			}
+			if info.Status == "rejected" && info.Window != "" {
+				return quotaFailure("", http.StatusTooManyRequests, info, body)
+			}
+			for _, prefix := range []string{"Request rejected (429)", "Server is temporarily limiting requests (not your usage limit)"} {
+				if notice, ok := strings.CutPrefix(body, prefix); ok {
+					if failure := quotaFailure("", 0, quotaInfo{}, strings.TrimPrefix(notice, " · ")); failure != nil {
+						return failure
+					}
+					return upstreamFailure(http.StatusTooManyRequests, "")
+				}
+			}
+			if failure := quotaFailure("", 0, quotaInfo{}, body); failure != nil {
+				return failure
+			}
+			return upstreamFailure(0, "")
+		}
+	}
+	return Failure("AUXILIARY_NO_ANSWER", "inference", "official CLI returned no model answer to the background request", http.StatusUnprocessableEntity)
 }
 
 // Only recognize the CLI's measured quota or its exact legacy five-hour

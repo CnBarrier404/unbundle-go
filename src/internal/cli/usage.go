@@ -1,6 +1,11 @@
 package cli
 
-import "unbundle-go/src/internal/messages"
+import (
+	"context"
+	"encoding/json/v2"
+
+	"unbundle-go/src/internal/messages"
+)
 
 func usageFields(u *messages.Usage) []**int64 {
 	return []**int64{&u.InputTokens, &u.OutputTokens, &u.CacheReadInputTokens, &u.CacheCreationInputTokens}
@@ -66,9 +71,25 @@ type modelUsage struct {
 	Write  *int64 `json:"cacheCreationInputTokens"`
 }
 
+func (n *native) modelUsage(ctx context.Context) (map[string]modelUsage, error) {
+	value, err := n.control(ctx, map[string]any{"subtype": "get_usage", "skip_behaviors": true})
+	if err != nil {
+		return nil, err
+	}
+	var usage struct {
+		Session struct {
+			ModelUsage map[string]modelUsage `json:"model_usage"`
+		} `json:"session"`
+	}
+	if json.Unmarshal(value, &usage) != nil || usage.Session.ModelUsage == nil {
+		return nil, protocol()
+	}
+	return usage.Session.ModelUsage, nil
+}
+
 func modelUsageDifference(before, after map[string]modelUsage) (messages.Usage, error) {
-	if len(before) == 0 || len(after) == 0 {
-		return messages.Usage{}, Failure("COMPACTION_USAGE_UNKNOWN", "compaction", "native compaction usage could not be verified; do not repeat the operation", 502)
+	if before == nil || after == nil {
+		return messages.Usage{}, protocol()
 	}
 	total := zeroUsage()
 	for name := range before {

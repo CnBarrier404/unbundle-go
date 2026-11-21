@@ -45,13 +45,18 @@ func (n *native) updateThinking(ctx context.Context, request messages.Request) e
 func (n *native) control(ctx context.Context, request any, observers ...func([]byte) (bool, error)) (jsontext.Value, error) {
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
+	return n.requestControl(ctx, request, observers...)
+}
+
+// Inference-bearing controls use the HTTP request's deadline.
+func (n *native) requestControl(ctx context.Context, request any, observers ...func([]byte) (bool, error)) (jsontext.Value, error) {
 	id := "control_" + rand.Text()
 	frame, err := json.Marshal(map[string]any{"type": "control_request", "request_id": id, "request": request})
 	if err != nil {
 		return nil, protocol()
 	}
 	if _, err := n.stdin.Write(append(frame, '\n')); err != nil {
-		return nil, Failure("CLI_CONTROL_FAILED", "instructions", "could not submit native instruction update", 502)
+		return nil, Failure("CLI_CONTROL_FAILED", "control", "could not submit native control request", 502)
 	}
 	var output int64
 	for {

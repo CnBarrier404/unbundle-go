@@ -51,6 +51,7 @@ type native struct {
 	// result is cumulative; subtract previously reported HTTP tool boundaries.
 	accounted        messages.Usage
 	currentUsage     messages.Usage
+	lastQuota        quotaInfo
 	webPending       map[string]bool
 	instructions     []session.InstructionUpdate
 	id               string

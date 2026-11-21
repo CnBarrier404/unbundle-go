@@ -50,19 +50,14 @@ func (n *native) prepareCompact(ctx context.Context, waiting bool) (map[string]m
 	if waiting && (!slices.Contains(info.Capabilities, "interrupt_receipt_v1") || !slices.Contains(info.Capabilities, "interrupt_cancel_queued_v1")) {
 		return nil, validation("NATIVE_COMPACT_INTERRUPT_UNAVAILABLE", "tool-boundary compaction requires confirmed interruption and queue cancellation; submit the real results normally")
 	}
-	value, err := n.control(ctx, map[string]any{"subtype": "get_usage", "skip_behaviors": true})
+	usage, err := n.modelUsage(ctx)
 	if err != nil {
 		return nil, err
 	}
-	var usage struct {
-		Session struct {
-			ModelUsage map[string]modelUsage `json:"model_usage"`
-		} `json:"session"`
-	}
-	if json.Unmarshal(value, &usage) != nil || len(usage.Session.ModelUsage) == 0 {
+	if len(usage) == 0 {
 		return nil, validation("NATIVE_COMPACT_USAGE_UNAVAILABLE", "official CLI did not provide cumulative usage; the conversation was preserved")
 	}
-	return usage.Session.ModelUsage, nil
+	return usage, nil
 }
 
 func (n *native) interruptForCompact(ctx context.Context) error {
@@ -268,6 +263,9 @@ func (n *native) compact(ctx context.Context, request messages.Request, buffered
 		case "result":
 			if frame.Session != n.id || frame.Error || frame.Subtype != "success" || boundary == "" {
 				return "", messages.Usage{}, Failure("NATIVE_COMPACT_NOT_COMMITTED", "compaction", "official CLI did not confirm native compaction", 502)
+			}
+			if len(frame.Usage) == 0 {
+				return "", messages.Usage{}, Failure("COMPACTION_USAGE_UNKNOWN", "compaction", "native compaction usage could not be verified; do not repeat the operation", 502)
 			}
 			usage, err := modelUsageDifference(before, frame.Usage)
 			n.currentUsage = usage
