@@ -161,7 +161,7 @@ func (a *Adapter) acquire(ctx context.Context, request messages.Request, identit
 		if source, compact := session.CompactionIntent(request, identity); compact {
 			lookup = source
 		}
-		if entry.checkpoint != nil && (len(candidate.Request.Messages) == 0 || entry.checkpoint.PendingInput) {
+		if entry.checkpoint != nil && (len(candidate.Request.Messages) == 0 || entry.checkpoint.Interrupted) {
 			candidate = a.store.Materialize(*entry.checkpoint, lookup, a.Config)
 		}
 		if entry.checkpoint != nil && entry.checkpoint.Compaction != nil {
@@ -236,7 +236,7 @@ func (a *Adapter) acquire(ctx context.Context, request messages.Request, identit
 		id := rand.Text()
 		entry = &conversation{boundary: session.Candidate{ID: id, Identity: identity, State: session.Idle, Request: request}, lastUsed: time.Now()}
 		a.entries[id] = entry
-	} else if len(entry.boundary.Request.Messages) == 0 || entry.checkpoint != nil && entry.checkpoint.PendingInput {
+	} else if len(entry.boundary.Request.Messages) == 0 || entry.checkpoint != nil && entry.checkpoint.Interrupted {
 		lookup := request
 		if source, compact := session.CompactionIntent(request, identity); compact && match.Kind != session.CompactRetry {
 			lookup = source

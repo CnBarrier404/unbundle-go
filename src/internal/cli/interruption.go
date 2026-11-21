@@ -14,11 +14,7 @@ func (a *Adapter) saveInterrupted(n *native, row session.Checkpoint, request mes
 	if n == nil || input == nil || len(request.Messages) == 0 {
 		return nil
 	}
-	if len(n.expected) == 0 {
-		blocks, err := session.TextInput(input.Content)
-		if err != nil {
-			return nil
-		}
+	if blocks, err := session.TextInput(input.Content); err == nil {
 		snapshot, err := a.store.SnapshotInput(n.id, blocks)
 		if err != nil {
 			n.logger.Warn("interrupted_checkpoint_unavailable")
@@ -34,7 +30,9 @@ func (a *Adapter) saveInterrupted(n *native, row session.Checkpoint, request mes
 		return &row
 	}
 	blocks, err := messages.Blocks(request.Messages[len(request.Messages)-1].Content)
-	if err != nil || len(blocks) != len(n.expected) {
+	// advance clears expected when the next assistant message starts.
+	// returned and the native transcript still identify committed receipts.
+	if err != nil || len(blocks) == 0 {
 		return nil
 	}
 	var receipts []jsontext.Value

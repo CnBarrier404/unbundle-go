@@ -203,6 +203,11 @@ func (s *Store) Materialize(row Checkpoint, incoming messages.Request, c config.
 	if row.PendingInput {
 		return s.materializeInterrupted(row, incoming, c)
 	}
+	if row.Interrupted {
+		if merged := s.materializeInterrupted(row, incoming, c); merged.RebasedDelta != nil {
+			return merged
+		}
+	}
 	if row.Compaction != nil {
 		view.Compaction = row.Compaction
 		digest, err := s.requestDigest(incoming)

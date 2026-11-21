@@ -7,6 +7,7 @@ import (
 	"slices"
 
 	"unbundle-go/src/internal/config"
+	"unbundle-go/src/internal/jsonutil"
 	"unbundle-go/src/internal/messages"
 )
 
@@ -63,18 +64,45 @@ func (s *Store) RecoverInterruptedInput(row Checkpoint) (Checkpoint, error) {
 	if err := scanner.Err(); err != nil {
 		return row, err
 	}
-	if last.Role != "user" || !s.messageMatches(row.History[len(row.History)-1], last) {
+	if last.Role != "user" {
 		return row, errors.New("native input does not match interrupted checkpoint")
 	}
-	blocks, err := TextInput(last.Content)
+	blocks, err := messages.Blocks(last.Content)
 	if err != nil {
 		return row, err
+	}
+	_, textErr := TextInput(last.Content)
+	fingerprint := row.History[len(row.History)-1]
+	if textErr != nil {
+		// The MCP bridge represents string results as single text blocks.
+		// Compare the original spelling as well, keeping the native bytes for the snapshot.
+		short := slices.Clone(blocks)
+		for i, raw := range blocks {
+			var receipt messages.ToolResultBlock
+			if jsonutil.Object(raw, &receipt) != nil || receipt.Type != "tool_result" || receipt.ToolUseID == "" {
+				return row, errors.New("invalid interrupted tool receipt")
+			}
+			if alt, ok := alternateTextForm(messages.Message{Content: receipt.Content}); ok && alt.Content.Kind() == '"' {
+				receipt.Content = alt.Content
+				short[i], _ = json.Marshal(receipt)
+			}
+		}
+		if !s.messageMatches(fingerprint, last) {
+			last.Content, _ = json.Marshal(short)
+		}
+	}
+	if !s.messageMatches(fingerprint, last) {
+		return row, errors.New("native input does not match interrupted checkpoint")
 	}
 	snapshot, err := s.SnapshotInput(row.NativeID, blocks)
 	if err != nil {
 		return row, err
 	}
-	row.Ready, row.Interrupted, row.PendingInput, row.Snapshot = true, true, true, snapshot
+	row.Interrupted = true
+	if textErr != nil {
+		return s.Complete(row, InterruptionReceipt(), snapshot)
+	}
+	row.Ready, row.PendingInput, row.Snapshot = true, true, snapshot
 	return row, s.Put(row)
 }
 
@@ -96,11 +124,30 @@ func (s *Store) materializeInterrupted(row Checkpoint, incoming messages.Request
 	if last.Role != "user" {
 		return view
 	}
-	blocks, err := TextInput(last.Content)
+	blocks, err := messages.Blocks(last.Content)
 	if err != nil {
 		return view
 	}
-	for end := 1; end <= len(blocks); end++ {
+	first, limit := 1, len(blocks)
+	if !row.PendingInput {
+		// Desktop merges the receipts, its Esc marker, and new user text.
+		// Only the receipt prefix belongs to the verified checkpoint.
+		first = 0
+		for _, raw := range blocks {
+			var receipt messages.ToolResultBlock
+			if json.Unmarshal(raw, &receipt) != nil || receipt.Type != "tool_result" {
+				break
+			}
+			first++
+		}
+		if first == 0 || first+1 >= len(blocks) || !interruptMarker(blocks[first]) {
+			return view
+		}
+		limit = first
+	} else if _, err := TextInput(last.Content); err != nil {
+		return view
+	}
+	for end := first; end <= limit; end++ {
 		original := last
 		original.Content, _ = json.Marshal(blocks[:end])
 		if !s.messageMatches(row.History[count-1], original) {
@@ -118,9 +165,13 @@ func (s *Store) materializeInterrupted(row Checkpoint, incoming messages.Request
 			view.State = Idle
 		}
 		var delta []messages.Message
-		if end < len(blocks) {
+		start := end
+		if start < len(blocks) && interruptMarker(blocks[start]) {
+			start++
+		}
+		if start < len(blocks) {
 			added := last
-			added.Content, _ = json.Marshal(blocks[end:])
+			added.Content, _ = json.Marshal(blocks[start:])
 			delta = append(delta, added)
 		}
 		tail := incoming.Messages[count:]
@@ -141,4 +192,10 @@ func (s *Store) materializeInterrupted(row Checkpoint, incoming messages.Request
 		return view
 	}
 	return view
+}
+
+func interruptMarker(raw jsontext.Value) bool {
+	var block messages.TextBlock
+	return jsonutil.Object(raw, &block) == nil && block.Type == "text" && block.Text != nil &&
+		(*block.Text == "[Request interrupted by user]" || *block.Text == "[Request interrupted by user]\n")
 }
