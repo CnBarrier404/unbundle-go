@@ -1,10 +1,15 @@
 package cli
 
 import (
+	"context"
+	"encoding/json/v2"
+	"log/slog"
 	"net/http"
 	"regexp"
 	"strings"
 	"time"
+
+	"unbundle-go/src/internal/logging"
 )
 
 const QuotaExhausted = "UPSTREAM_QUOTA_EXHAUSTED"
@@ -13,6 +18,66 @@ type quotaInfo struct {
 	Status   string `json:"status"`
 	Window   string `json:"rateLimitType"`
 	ResetsAt int64  `json:"resetsAt"`
+}
+
+type quotaObservation struct {
+	quotaInfo
+	Utilization *float64 `json:"utilization"`
+}
+
+// Rate-limit notifications are advisory. Log only recognized fields, and keep
+// unfamiliar or malformed notifications out of request handling.
+func (n *native) logQuotaEvent(ctx context.Context, line []byte) {
+	var event struct {
+		SessionID string `json:"session_id"`
+		Info      struct {
+			quotaObservation
+			Windows struct {
+				FiveHour *quotaObservation `json:"five_hour"`
+				SevenDay *quotaObservation `json:"seven_day"`
+			} `json:"unifiedWindows"`
+		} `json:"rate_limit_info"`
+	}
+	if json.Unmarshal(line, &event) != nil || event.SessionID != n.id {
+		return
+	}
+	logger := logging.From(ctx)
+	logWindow := func(window string, observation quotaObservation) {
+		attrs := []any{"quota_window", window}
+		switch observation.Status {
+		case "allowed", "allowed_warning", "rejected":
+			attrs = append(attrs, "quota_status", observation.Status)
+		}
+		if observation.ResetsAt > 0 {
+			attrs = append(attrs, "quota_reset_at", observation.ResetsAt)
+		}
+		if observation.Utilization != nil && *observation.Utilization >= 0 {
+			attrs = append(attrs, slog.Float64("quota_utilization", *observation.Utilization))
+		}
+		if len(attrs) > 2 {
+			logger.InfoContext(ctx, "quota_observed", attrs...)
+		}
+	}
+	if event.Info.Windows.FiveHour != nil {
+		logWindow("five_hour", *event.Info.Windows.FiveHour)
+	}
+	if event.Info.Windows.SevenDay != nil {
+		logWindow("seven_day", *event.Info.Windows.SevenDay)
+	}
+	switch event.Info.Window {
+	case "five_hour":
+		if event.Info.Windows.FiveHour != nil {
+			return
+		}
+	case "seven_day":
+		if event.Info.Windows.SevenDay != nil {
+			return
+		}
+	case "seven_day_opus", "seven_day_sonnet", "seven_day_overage_included", "overage":
+	default:
+		return
+	}
+	logWindow(event.Info.Window, event.Info.quotaObservation)
 }
 
 // Only recognize the CLI's measured quota or its exact legacy five-hour

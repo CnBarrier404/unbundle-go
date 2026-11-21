@@ -89,7 +89,9 @@ func (n *native) control(ctx context.Context, request any, observers ...func([]b
 				return nil, Failure("CLI_CONTROL_REJECTED", "control", "official CLI rejected the native control request", 502)
 			}
 			return frame.Response.Response, nil
-		case "system", "rate_limit_event", "tool_progress", "command_lifecycle":
+		case "rate_limit_event":
+			n.logQuotaEvent(ctx, line)
+		case "system", "tool_progress", "command_lifecycle":
 			if err := n.p.accept(line); err != nil {
 				return nil, err
 			}

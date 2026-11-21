@@ -273,6 +273,7 @@ func (n *native) compact(ctx context.Context, request messages.Request, buffered
 			n.currentUsage = usage
 			return boundary, usage, err
 		case "rate_limit_event":
+			n.logQuotaEvent(ctx, line)
 		default:
 			return "", messages.Usage{}, protocol()
 		}

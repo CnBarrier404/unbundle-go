@@ -401,6 +401,11 @@ func (n *native) handoff() (bool, error) {
 
 func (n *native) advance(ctx context.Context, request messages.Request, delta messages.Message, results map[string]*mcp.CallToolResult, updates []session.InstructionUpdate, emit func(Event) error) (response messages.Response, err error) {
 	n.currentUsage = messages.Usage{}
+	defer func() {
+		if err != nil {
+			response.Usage = n.currentUsage
+		}
+	}()
 	if n.timer != nil {
 		n.timer.Stop()
 	}
@@ -512,6 +517,10 @@ func (n *native) advance(ctx context.Context, request messages.Request, delta me
 			}
 			if json.Unmarshal(line, &frame) != nil {
 				return response, protocol()
+			}
+			if frame.Type == "rate_limit_event" {
+				n.logQuotaEvent(ctx, line)
+				continue
 			}
 			if frame.Type == "result" {
 				var fields map[string]jsontext.Value

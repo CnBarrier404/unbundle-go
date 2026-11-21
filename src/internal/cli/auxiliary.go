@@ -57,6 +57,7 @@ func (a *Adapter) runAuxiliary(ctx context.Context, request messages.Request, id
 		return response, err
 	}
 	logger := logging.From(ctx).With("session_id", entry.boundary.ID, "auxiliary_kind", kind)
+	ctx = logging.With(ctx, logger)
 	lifetime := logging.With(a.ctx, logger)
 	n, err := (Runner{Config: a.Config}).start(lifetime, ctx, request, b, &row, true)
 	if err != nil {

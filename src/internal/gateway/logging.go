@@ -21,6 +21,23 @@ type loggedResponse struct {
 	result   string
 	model    string
 	stream   bool
+	usage    messages.Usage
+	partial  bool
+	reused   bool
+}
+
+func (w *loggedResponse) recordInference(response messages.Response, err error) {
+	w.reused = response.Reused
+	if w.reused {
+		return // A replayed receipt represents a prior request's usage.
+	}
+	w.usage = response.Usage
+	if err != nil {
+		w.partial = true
+		if usage := apiError(err).Usage; usage != (messages.Usage{}) {
+			w.usage = usage
+		}
+	}
 }
 
 func (w *loggedResponse) Unwrap() http.ResponseWriter { return w.ResponseWriter }
@@ -48,7 +65,7 @@ func (w *loggedResponse) finish(logger *slog.Logger, r *http.Request, start time
 	level := slog.LevelInfo
 	attrs := []any{"http_status", w.status, "duration_ms", time.Since(start).Milliseconds(), "response_bytes", w.bytes}
 	if w.model != "" {
-		attrs = append(attrs, "model", w.model, "stream", w.stream)
+		attrs = append(attrs, "model", w.model, "stream", w.stream, "response_reused", w.reused)
 	}
 	if w.failure != nil {
 		level = slog.LevelWarn
@@ -57,6 +74,12 @@ func (w *loggedResponse) finish(logger *slog.Logger, r *http.Request, start time
 		}
 		w.result = "failed"
 		attrs = append(attrs, "error_code", w.failure.Code, "stage", w.failure.Stage, "outcome", w.failure.Outcome, "retryable", w.failure.Retryable)
+		if w.failure.QuotaWindow != "" {
+			attrs = append(attrs, "quota_window", w.failure.QuotaWindow)
+		}
+		if w.failure.QuotaResetAt > 0 {
+			attrs = append(attrs, "quota_reset_at", w.failure.QuotaResetAt)
+		}
 		if w.writeErr != nil {
 			attrs = append(attrs, logging.Cause(w.writeErr))
 		}
@@ -67,6 +90,23 @@ func (w *loggedResponse) finish(logger *slog.Logger, r *http.Request, start time
 			cause = r.Context().Err()
 		}
 		attrs = append(attrs, logging.Cause(cause))
+	}
+	var usage []any
+	for _, counter := range []struct {
+		name  string
+		value *int64
+	}{
+		{"input_tokens", w.usage.InputTokens},
+		{"output_tokens", w.usage.OutputTokens},
+		{"cache_read_input_tokens", w.usage.CacheReadInputTokens},
+		{"cache_creation_input_tokens", w.usage.CacheCreationInputTokens},
+	} {
+		if counter.value != nil {
+			usage = append(usage, slog.Int64(counter.name, *counter.value))
+		}
+	}
+	if len(usage) > 0 {
+		attrs = append(attrs, slog.Group("usage", usage...), "usage_partial", w.partial || len(usage) < 4)
 	}
 	attrs = append(attrs, "result", w.result)
 	logger.Log(r.Context(), level, "request_finished", attrs...)

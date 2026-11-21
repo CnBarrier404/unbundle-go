@@ -285,6 +285,7 @@ func (s *Server) infer(w *loggedResponse, r *http.Request, request messages.Requ
 	defer cancel()
 	if !request.Stream {
 		response, err := s.runner.Run(ctx, request, identity, nil)
+		w.recordInference(response, err)
 		if err != nil {
 			s.fail(w, err, id)
 			return
@@ -326,7 +327,8 @@ func (s *Server) infer(w *loggedResponse, r *http.Request, request messages.Requ
 	defer func() {
 		cancel()
 		if !finished {
-			<-done
+			result := <-done
+			w.recordInference(result.response, result.err)
 		}
 	}()
 	started := false
@@ -367,6 +369,7 @@ func (s *Server) infer(w *loggedResponse, r *http.Request, request messages.Requ
 			}
 		case result := <-done:
 			finished = true
+			w.recordInference(result.response, result.err)
 			if result.err != nil {
 				if !started {
 					s.fail(w, result.err, id)

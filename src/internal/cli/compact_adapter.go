@@ -49,6 +49,7 @@ func (a *Adapter) runCompact(ctx context.Context, entry *conversation, match ses
 			entry.boundary.State = session.Idle
 		}
 		if accepted && err != nil {
+			response.Usage = n.currentUsage
 			entry.boundary.State = session.Closed
 			var failure *Error
 			if errors.As(err, &failure) {
