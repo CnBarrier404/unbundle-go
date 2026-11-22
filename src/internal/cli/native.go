@@ -55,6 +55,7 @@ type native struct {
 	currentUsage     messages.Usage
 	lastQuota        quotaInfo
 	webPending       map[string]bool
+	webEvidence      *messages.WebSearchEvidence
 	instructions     []session.InstructionUpdate
 	id               string
 	initialMessages  int
@@ -366,7 +367,7 @@ func (n *native) handoff() (ready bool, invalid map[string]string, err error) {
 	}
 	if len(n.expected) == 0 {
 		for _, block := range n.p.blocks {
-			if block.Type != "tool_use" || block.Name == toolSearch {
+			if block.Type != "tool_use" || block.Name == toolSearch || block.Name == "WebSearch" {
 				continue
 			}
 			if n.seen[block.ID] {
@@ -459,11 +460,6 @@ func (n *native) advance(ctx context.Context, request messages.Request, delta me
 	searching := false
 	searchCalls := 0
 	discoveryCalls := 0
-	var webEvidence *messages.WebSearchEvidence
-	if n.bridge.webSchema != nil {
-		requests, hits := int64(0), int64(0)
-		webEvidence = &messages.WebSearchEvidence{Requests: &requests, Hits: &hits}
-	}
 	hiddenUsage := zeroUsage()
 	var prefix []jsontext.Value
 	var handoffTimer *time.Timer
@@ -572,15 +568,9 @@ func (n *native) advance(ctx context.Context, request messages.Request, delta me
 						}
 						continue
 					}
-					if searching && n.webPending[receipt.ToolUseID] {
-						if receipt.IsError != nil && *receipt.IsError {
-							return response, Failure("WEB_SEARCH_FAILED", "web_search", "official CLI WebSearch failed; raw search diagnostics were withheld", 502)
-						}
-						delete(n.webPending, receipt.ToolUseID)
-						if len(blocks) == 1 {
-							observeWebSearch(webEvidence, frame.ToolUseResult)
-						} else {
-							observeWebSearch(webEvidence, nil)
+					if handled, err := n.webSearchReceipt(receipt, frame.ToolUseResult, len(blocks)); handled {
+						if err != nil {
+							return response, err
 						}
 						continue
 					}
@@ -602,6 +592,9 @@ func (n *native) advance(ctx context.Context, request messages.Request, delta me
 			}
 			newMessage := frame.Type == "stream_event" && frame.Event.Type == "message_start" && frame.Event.Message.ID != n.p.response.ID || frame.Type == "assistant" && frame.Message.ID != n.p.response.ID
 			if newMessage {
+				if len(n.webPending) != 0 {
+					return response, protocol()
+				}
 				for _, pending := range n.p.discoveries {
 					if pending {
 						return response, protocol()
@@ -609,9 +602,6 @@ func (n *native) advance(ctx context.Context, request messages.Request, delta me
 				}
 			}
 			if searching && newMessage {
-				if len(n.webPending) != 0 {
-					return response, protocol()
-				}
 				n.p = n.parser(request.Model, emit)
 				searching = false
 			}
@@ -640,60 +630,42 @@ func (n *native) advance(ctx context.Context, request messages.Request, delta me
 			}
 		}
 		if !resumingTools && !searching {
-			if n.p.terminal && n.p.response.StopReason != nil && *n.p.response.StopReason == messages.StopToolUse {
-				if len(n.expected) == 0 {
-					for id := range n.p.discoveries {
-						if n.seen[id] {
-							return response, protocol()
-						}
-						n.seen[id] = true
+			if n.p.terminal && n.p.response.StopReason != nil && *n.p.response.StopReason == messages.StopToolUse && len(n.expected) == 0 {
+				for id := range n.p.discoveries {
+					if n.seen[id] {
+						return response, protocol()
 					}
-					discoveryCalls += len(n.p.discoveries)
-					if discoveryCalls > 8 {
-						return response, Failure("TOOL_SEARCH_CALL_LIMIT", "tools", "native ToolSearch call limit exceeded", 502)
-					}
+					n.seen[id] = true
 				}
-				web, local := 0, 0
+				discoveryCalls += len(n.p.discoveries)
+				if discoveryCalls > 8 {
+					return response, Failure("TOOL_SEARCH_CALL_LIMIT", "tools", "native ToolSearch call limit exceeded", 502)
+				}
+				local := 0
+				n.webPending = make(map[string]bool)
 				for _, block := range n.p.blocks {
-					if block.Type == "tool_use" {
-						if block.Name == "WebSearch" {
-							web++
-						} else if block.Name != toolSearch {
-							local++
-						}
+					if block.Type != "tool_use" || block.Name == toolSearch {
+						continue
 					}
-				}
-				if web > 0 || local == 0 {
-					if local > 0 {
-						return response, Failure("MIXED_WEB_SEARCH_BATCH_UNSUPPORTED", "web_search", "WebSearch and local tools must use separate native batches; no local tools were delivered", 502)
+					if block.Name != "WebSearch" {
+						local++
+						continue
 					}
-					searchCalls += web
+					if n.seen[block.ID] {
+						return response, protocol()
+					}
+					searchCalls++
 					if searchCalls > 8 {
 						return response, Failure("WEB_SEARCH_CALL_LIMIT", "web_search", "native WebSearch call limit exceeded", 502)
 					}
-					n.webPending = make(map[string]bool)
-					for _, block := range n.p.blocks {
-						if block.Type != "tool_use" || block.Name == toolSearch {
-							continue
-						}
-						if n.seen[block.ID] {
-							return response, protocol()
-						}
-						if err := n.bridge.validate(block); err != nil {
-							return response, err
-						}
-						n.webPending[block.ID] = true
-						n.seen[block.ID] = true
+					if err := n.bridge.validate(block); err != nil {
+						return response, err
 					}
-					for _, raw := range n.p.response.Content {
-						var b struct {
-							Type string `json:"type"`
-						}
-						_ = json.Unmarshal(raw, &b)
-						if b.Type != "tool_use" {
-							prefix = append(prefix, raw)
-						}
-					}
+					n.webPending[block.ID] = true
+					n.seen[block.ID] = true
+				}
+				if local == 0 {
+					prefix = append(prefix, n.p.response.Content...)
 					hiddenUsage = addUsage(hiddenUsage, n.p.response.Usage)
 					searching = true
 					continue
@@ -736,7 +708,10 @@ func (n *native) advance(ctx context.Context, request messages.Request, delta me
 		}
 	}
 	response = n.p.response
-	response.WebSearch = webEvidence
+	if n.bridge.webSchema != nil {
+		response.WebSearch = n.searchEvidence()
+		n.webEvidence = nil
+	}
 	response.Content = append(prefix, response.Content...)
 	if !n.p.result {
 		response.Usage = addUsage(hiddenUsage, response.Usage)

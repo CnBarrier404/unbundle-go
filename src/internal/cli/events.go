@@ -221,7 +221,7 @@ func (p *parser) finish() error {
 				return protocol()
 			}
 			ids[b.ID] = true
-			if b.Name == toolSearch {
+			if b.Name == toolSearch || b.Name == "WebSearch" {
 				continue
 			}
 			raw, err = json.Marshal(messages.ToolUseBlock{Type: "tool_use", ID: b.ID, Name: p.tools[b.Name], Input: b.Input})

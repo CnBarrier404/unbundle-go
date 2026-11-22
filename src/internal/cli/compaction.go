@@ -126,6 +126,7 @@ func (n *native) interruptForCompact(ctx context.Context) error {
 	n.expected = make(map[string]block)
 	n.results = make(map[string]*mcp.CallToolResult)
 	n.returned = make(map[string]bool)
+	n.webPending, n.webEvidence = nil, nil
 	n.accounted = zeroUsage()
 	return nil
 }

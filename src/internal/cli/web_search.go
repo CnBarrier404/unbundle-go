@@ -9,6 +9,33 @@ import (
 	"unbundle-go/src/internal/messages"
 )
 
+func (n *native) searchEvidence() *messages.WebSearchEvidence {
+	if n.webEvidence == nil {
+		requests, hits := int64(0), int64(0)
+		n.webEvidence = &messages.WebSearchEvidence{Requests: &requests, Hits: &hits}
+	}
+	return n.webEvidence
+}
+
+func (n *native) webSearchReceipt(receipt messages.ToolResultBlock, raw jsontext.Value, blockCount int) (bool, error) {
+	if !n.webPending[receipt.ToolUseID] {
+		return false, nil
+	}
+	delete(n.webPending, receipt.ToolUseID)
+	if receipt.IsError != nil && *receipt.IsError {
+		if len(n.expected) == 0 {
+			return true, Failure("WEB_SEARCH_FAILED", "web_search", "official CLI WebSearch failed; raw search diagnostics were withheld", 502)
+		}
+		// The CLI already has this error result. Let the local calls finish.
+		raw = nil
+	}
+	if blockCount != 1 {
+		raw = nil
+	}
+	observeWebSearch(n.searchEvidence(), raw)
+	return true, nil
+}
+
 // Count only results bound to an observed native WebSearch call. A tool return
 // alone is not proof of a search: absent CLI metadata remains unknown.
 func observeWebSearch(e *messages.WebSearchEvidence, raw jsontext.Value) {
