@@ -191,7 +191,7 @@ func (a *Adapter) acquire(ctx context.Context, request messages.Request, identit
 		var boundary *session.Error
 		if errors.As(err, &boundary) {
 			logging.From(ctx).Warn("session_boundary_rejected", "error_code", boundary.Code, "detail", boundary.Detail)
-			message := boundary.Code + ": request does not match a safe native session boundary"
+			message := "request does not match a safe native session boundary"
 			if boundary.Detail != "" {
 				message += " (" + boundary.Detail + ")"
 			}

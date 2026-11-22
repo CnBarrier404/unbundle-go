@@ -172,13 +172,19 @@ func apiError(err error) *cli.Error {
 	return &cli.Error{Code: code, Type: "invalid_request_error", Message: "invalid, unsupported or oversized request", Stage: "validation", Outcome: "not_started", Status: status}
 }
 
+func errorResponse(failure *cli.Error, requestID string) map[string]any {
+	public := *failure
+	public.Message = failure.Error()
+	return map[string]any{"type": "error", "error": public, "request_id": requestID}
+}
+
 func (s *Server) fail(w *loggedResponse, err error, requestID string) {
 	e := apiError(err)
 	if e.Code == cli.QuotaExhausted {
 		e = s.quotaError(w, e, false)
 	}
 	w.failure = e
-	_ = s.writeJSON(w, e.Status, map[string]any{"type": "error", "error": e, "request_id": requestID})
+	_ = s.writeJSON(w, e.Status, errorResponse(e, requestID))
 }
 
 func reject(code, message string, status int) *cli.Error {
@@ -378,7 +384,7 @@ func (s *Server) infer(w *loggedResponse, r *http.Request, request messages.Requ
 					if w.failure.Code == cli.QuotaExhausted {
 						w.failure = s.quotaError(w, w.failure, true)
 					}
-					_ = send("error", map[string]any{"type": "error", "error": w.failure, "request_id": id})
+					_ = send("error", errorResponse(w.failure, id))
 				}
 				return
 			}
