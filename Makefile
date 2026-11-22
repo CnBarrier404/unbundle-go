@@ -5,7 +5,6 @@ build:
 
 fmt:
 	go fmt ./...
-	npx --no-install prettier --write .
 
 test:
 	go test ./...
