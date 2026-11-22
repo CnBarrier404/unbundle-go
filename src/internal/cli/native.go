@@ -340,7 +340,7 @@ func (n *native) flush() error {
 		if !ok {
 			continue
 		}
-		if err := n.bridge.verify(call, expected); err != nil {
+		if err := n.bridge.matchCall(call, expected); err != nil {
 			return err
 		}
 		if result := n.results[id]; result != nil {
@@ -360,9 +360,9 @@ func (n *native) flush() error {
 	return nil
 }
 
-func (n *native) handoff() (bool, error) {
+func (n *native) handoff() (ready bool, invalid map[string]string, err error) {
 	if !n.p.terminal || n.p.response.StopReason == nil || *n.p.response.StopReason != messages.StopToolUse {
-		return false, nil
+		return false, nil, nil
 	}
 	if len(n.expected) == 0 {
 		for _, block := range n.p.blocks {
@@ -370,17 +370,24 @@ func (n *native) handoff() (bool, error) {
 				continue
 			}
 			if n.seen[block.ID] {
-				return false, protocol()
+				return false, nil, protocol()
 			}
 			if err := n.bridge.validate(block); err != nil {
-				return false, err
+				var failure *Error
+				if !errors.As(err, &failure) || failure.Code != toolArgumentsInvalid {
+					return false, nil, err
+				}
+				if invalid == nil {
+					invalid = make(map[string]string)
+				}
+				invalid[block.ID] = failure.Message
 			}
 			n.expected[block.ID] = block
 		}
 	}
 	for id := range n.pending {
 		if n.expected[id].ID == "" {
-			return false, protocol()
+			return false, nil, protocol()
 		}
 	}
 	waiters := 0
@@ -389,23 +396,23 @@ func (n *native) handoff() (bool, error) {
 		if call == nil {
 			// Snapshot-only calls lack independently verified streamed JSON.
 			// They may not be delivered before their own MCP waiter exists.
-			if !n.p.streamed[id] {
-				return false, nil
+			if invalid == nil && !n.p.streamed[id] {
+				return false, nil, nil
 			}
 			continue
 		}
-		if err := n.bridge.verify(call, expected); err != nil {
-			return false, err
+		if err := n.bridge.matchCall(call, expected); err != nil {
+			return false, nil, err
 		}
 		waiters++
 	}
-	if waiters == 0 {
-		return false, nil
+	if waiters == 0 && invalid == nil {
+		return false, nil, nil
 	}
 	for id := range n.expected {
 		n.seen[id] = true
 	}
-	return true, nil
+	return invalid == nil, invalid, nil
 }
 
 func (n *native) advance(ctx context.Context, request messages.Request, delta messages.Message, results map[string]*mcp.CallToolResult, updates []session.InstructionUpdate, emit func(Event) error) (response messages.Response, err error) {
@@ -448,6 +455,7 @@ func (n *native) advance(ctx context.Context, request messages.Request, delta me
 		n.resumedResults = nil
 	}
 	var output int64
+	var invalidTools map[string]string
 	searching := false
 	searchCalls := 0
 	discoveryCalls := 0
@@ -576,6 +584,16 @@ func (n *native) advance(ctx context.Context, request messages.Request, delta me
 						}
 						continue
 					}
+					if invalidTools != nil && n.expected[receipt.ToolUseID].ID != "" {
+						if receipt.IsError == nil || !*receipt.IsError {
+							return response, protocol()
+						}
+						if invalidTools[receipt.ToolUseID] != "" && n.pending[receipt.ToolUseID] == nil {
+							// The CLI can reject invalid arguments before opening an MCP call.
+							n.returned[receipt.ToolUseID] = true
+							delete(n.results, receipt.ToolUseID)
+						}
+					}
 					if !n.returned[receipt.ToolUseID] {
 						return response, Failure("CLI_UNEXPECTED_TOOL_RESULT", "tools", "CLI produced a tool result before a real local result was handed back", 502)
 					}
@@ -606,9 +624,13 @@ func (n *native) advance(ctx context.Context, request messages.Request, delta me
 				n.expected = make(map[string]block)
 				n.p = n.parser(request.Model, emit)
 				resumingTools = false
+				invalidTools = nil
 			}
 			if err := n.p.accept(line); err != nil {
 				return response, err
+			}
+			if invalidTools != nil && n.p.result {
+				return response, Failure(toolArgumentsInvalid, "tools", "native turn ended without correcting invalid tool arguments", 502)
 			}
 			if !resumingTools && !searching {
 				n.currentUsage = addUsage(hiddenUsage, n.p.response.Usage)
@@ -677,9 +699,25 @@ func (n *native) advance(ctx context.Context, request messages.Request, delta me
 					continue
 				}
 			}
-			ready, err := n.handoff()
+			ready, invalid, err := n.handoff()
 			if err != nil {
 				return response, err
+			}
+			if len(invalid) > 0 {
+				// Reject the entire batch before publishing any tool use to the caller.
+				invalidTools, resumingTools = invalid, true
+				hiddenUsage = addUsage(hiddenUsage, n.p.response.Usage)
+				for id := range n.expected {
+					message := invalid[id]
+					if message == "" {
+						message = "No local tool ran because another call in this batch had invalid arguments. Resubmit any calls still needed."
+					}
+					n.results[id] = &mcp.CallToolResult{IsError: true, Content: []mcp.Content{&mcp.TextContent{Text: message}}}
+				}
+				if err := n.flush(); err != nil {
+					return response, err
+				}
+				continue
 			}
 			if ready {
 				break

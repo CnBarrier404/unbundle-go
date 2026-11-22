@@ -23,6 +23,7 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/santhosh-tekuri/jsonschema/v6"
+	"github.com/santhosh-tekuri/jsonschema/v6/kind"
 
 	"unbundle-go/src/internal/jsonutil"
 	"unbundle-go/src/internal/logging"
@@ -31,6 +32,7 @@ import (
 
 const mcpServerName = "local"
 const toolSearch = "ToolSearch"
+const toolArgumentsInvalid = "TOOL_ARGUMENTS_INVALID"
 
 // Leave room for the qualified MCP prefix within the upstream name limit.
 var readableToolName = regexp.MustCompile(`^[a-zA-Z0-9_-]{1,52}$`)
@@ -290,11 +292,18 @@ func (b *bridge) close() {
 }
 
 func (b *bridge) verify(call *toolCall, expected block) error {
+	if err := b.matchCall(call, expected); err != nil {
+		return err
+	}
+	return b.validate(expected)
+}
+
+func (b *bridge) matchCall(call *toolCall, expected block) error {
 	_, ok := b.definitions[call.name]
 	if !ok || expected.ID != call.id || expected.Name != "mcp__"+mcpServerName+"__"+call.name || !jsonutil.Equal(call.input, expected.Input) {
 		return Failure("MCP_CALL_MISMATCH", "tools", "native MCP ID, name or arguments do not match the observed call", 502)
 	}
-	return b.validate(expected)
+	return nil
 }
 
 func (b *bridge) validate(expected block) error {
@@ -309,22 +318,32 @@ func (b *bridge) validate(expected block) error {
 		}
 		schema = definition.schema
 	}
-	err := validateArguments(schema, expected.Input)
-	if b.regexFailed.Load() {
-		return Failure("TOOL_SCHEMA_PATTERN_FAILED", "tools", "tool schema pattern matching failed or exceeded its time limit", 502)
-	}
-	return err
-}
-
-func validateArguments(schema *jsonschema.Schema, raw jsontext.Value) error {
-	input, err := jsonschema.UnmarshalJSON(bytes.NewReader(raw))
+	input, err := jsonschema.UnmarshalJSON(bytes.NewReader(expected.Input))
 	if err != nil {
 		return protocol()
 	}
-	if err := schema.Validate(input); err != nil {
-		return Failure("TOOL_ARGUMENTS_INVALID", "tools", "tool arguments do not satisfy the caller schema", 502)
+	err = schema.Validate(input)
+	if b.regexFailed.Load() {
+		return Failure("TOOL_SCHEMA_PATTERN_FAILED", "tools", "tool schema pattern matching failed or exceeded its time limit", 502)
 	}
-	return nil
+	if err == nil {
+		return nil
+	}
+	attrs := []any{"error_code", toolArgumentsInvalid, "tool_name", b.names[expected.Name], "tool_use_id", expected.ID}
+	var violation *jsonschema.ValidationError
+	if errors.As(err, &violation) {
+		// The full validation error can contain argument values. Use only schema metadata.
+		for len(violation.Causes) > 0 {
+			violation = violation.Causes[0]
+		}
+		_, fragment, _ := strings.Cut(violation.SchemaURL, "#")
+		attrs = append(attrs, "schema_path", "#"+fragment, "schema_keyword", strings.Join(violation.ErrorKind.KeywordPath(), "/"))
+		if required, ok := violation.ErrorKind.(*kind.Required); ok {
+			attrs = append(attrs, "missing_fields", required.Missing)
+		}
+	}
+	b.logger.Error("tool_arguments_invalid", attrs...)
+	return Failure(toolArgumentsInvalid, "tools", "tool arguments do not satisfy the caller schema", 502)
 }
 
 func toolResult(raw messages.ToolResultBlock) (*mcp.CallToolResult, error) {
